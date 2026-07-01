@@ -4601,7 +4601,29 @@ def compose(plan_path: Path) -> dict[str, Any]:
     addon_dir.mkdir(parents=True, exist_ok=True)
     emit("Prepared QC source folder.")
 
-    gmod = plan["gmod"]
+    gmod = dict(plan["gmod"]) if isinstance(plan.get("gmod"), dict) else {}
+    # Re-resolve the game tooling (studiomdl + game dir) for the plan's TARGET game so the compile
+    # -game, gmad.exe search, and addons install are ALWAYS consistent with the selected game
+    # (manual = Step 1, auto-port = main interface -> plan["game"]). plan["gmod"] can go stale: on a
+    # manual compile update_qc_plan_from_gui() refreshes studiomdl_path but NOT game_dir/install_root,
+    # so switching target game after Analyze left a GMod studiomdl paired with a leftover L4D2 game_dir
+    # (gmad searched in Left 4 Dead 2\bin, addon installed to the L4D2 addons folder). detect_game
+    # prioritises the explicit studiomdl, so the user's set studiomdl is preserved and the matching
+    # game dir is derived from it.
+    resolved_game = detect_game(
+        normalize_game(plan.get("game")),
+        str(gmod.get("install_root") or ""),
+        str(gmod.get("studiomdl_path") or ""),
+    )
+    if resolved_game.get("studiomdl_path") and resolved_game.get("game_dir"):
+        if str(resolved_game.get("game_dir")) != str(gmod.get("game_dir") or ""):
+            emit(
+                f"Re-resolved {normalize_game(plan.get('game'))} tooling for compile: "
+                f"game dir {resolved_game.get('game_dir')} (was {gmod.get('game_dir') or 'unset'})."
+            )
+        gmod.update({k: resolved_game[k] for k in ("install_root", "game_dir", "studiomdl_path") if resolved_game.get(k)})
+        plan["gmod"] = gmod
+        write_json(plan_path, plan)
     studiomdl = Path(str(gmod["studiomdl_path"]))
     game_dir = Path(str(gmod["game_dir"]))
     compile_studiomdl = studiomdl
