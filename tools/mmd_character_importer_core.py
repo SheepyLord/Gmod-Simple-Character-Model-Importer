@@ -5032,6 +5032,7 @@ def analyze_textures(
     cancel_check: CancelCheck | None = None,
     scheme: str = "legacy",
     game: str = "gmod",
+    max_texture_edge: int = 0,
 ) -> TextureAnalysisResult:
     input_path = input_path.resolve()
     texture_dir, analysis_path, plan_path, report_path, manifest_path, log_path = texture_paths_for_material_input(input_path)
@@ -5057,6 +5058,9 @@ def analyze_textures(
     # Only L4D2 passes --game (clamps textures to 2048px); GMod stays byte-identical.
     if str(game or "gmod").strip().lower() == "l4d2":
         command += ["--game", "l4d2"]
+    # Only a below-default "max texture size" choice is passed, so the default 4096 stays byte-identical.
+    if int(max_texture_edge or 0) and int(max_texture_edge) < 4096:
+        command += ["--max-texture-edge", str(int(max_texture_edge))]
     emit(progress, f"Starting Step 12 texture analysis: {input_path}")
     started = time.monotonic()
     run_process_streamed(command, progress=progress, log_path=log_path, cancel_check=cancel_check)
@@ -5087,6 +5091,7 @@ def process_textures(
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
     game: str = "gmod",
+    max_texture_edge: int = 0,
 ) -> TextureProcessResult:
     input_path = input_path.resolve()
     texture_dir, analysis_path, default_plan_path, report_path, manifest_path, log_path = texture_paths_for_material_input(input_path)
@@ -5117,6 +5122,9 @@ def process_textures(
     # Only L4D2 passes --game (clamps textures to 2048px); GMod stays byte-identical.
     if str(game or "gmod").strip().lower() == "l4d2":
         command += ["--game", "l4d2"]
+    # Only a below-default "max texture size" choice is passed, so the default 4096 stays byte-identical.
+    if int(max_texture_edge or 0) and int(max_texture_edge) < 4096:
+        command += ["--max-texture-edge", str(int(max_texture_edge))]
     emit(progress, f"Starting Step 12 texture processing: {input_path}")
     started = time.monotonic()
     run_process_streamed(command, progress=progress, log_path=log_path, cancel_check=cancel_check)

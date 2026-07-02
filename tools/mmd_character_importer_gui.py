@@ -2462,11 +2462,12 @@ class TextureAnalyzeWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_path: str, scheme: str = "legacy", game: str = "gmod") -> None:
+    def __init__(self, input_path: str, scheme: str = "legacy", game: str = "gmod", max_texture_edge: int = 0) -> None:
         super().__init__()
         self.input_path = input_path
         self.scheme = scheme or "legacy"
         self.game = game or "gmod"
+        self.max_texture_edge = int(max_texture_edge or 0)
         self.cancel_requested = False
 
     def cancel(self) -> None:
@@ -2480,7 +2481,7 @@ class TextureAnalyzeWorker(QtCore.QThread):
 
     def run(self) -> None:
         try:
-            result = core.analyze_textures(Path(self.input_path), progress=self._log, cancel_check=self._cancelled, scheme=self.scheme, game=self.game)
+            result = core.analyze_textures(Path(self.input_path), progress=self._log, cancel_check=self._cancelled, scheme=self.scheme, game=self.game, max_texture_edge=self.max_texture_edge)
             self.done.emit(
                 {
                     "input": str(result.input_path),
@@ -2503,11 +2504,12 @@ class TextureProcessWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_path: str, plan: dict[str, object], game: str = "gmod") -> None:
+    def __init__(self, input_path: str, plan: dict[str, object], game: str = "gmod", max_texture_edge: int = 0) -> None:
         super().__init__()
         self.input_path = input_path
         self.plan = plan
         self.game = game or "gmod"
+        self.max_texture_edge = int(max_texture_edge or 0)
         self.cancel_requested = False
 
     def cancel(self) -> None:
@@ -2521,7 +2523,7 @@ class TextureProcessWorker(QtCore.QThread):
 
     def run(self) -> None:
         try:
-            result = core.process_textures(Path(self.input_path), self.plan, progress=self._log, cancel_check=self._cancelled, game=self.game)
+            result = core.process_textures(Path(self.input_path), self.plan, progress=self._log, cancel_check=self._cancelled, game=self.game, max_texture_edge=self.max_texture_edge)
             self.done.emit(
                 {
                     "input": str(result.input_path),
@@ -2818,6 +2820,8 @@ class FullImportWorker(QtCore.QThread):
         copy_to_sfm_usermod: bool = True,
         nodecal: bool = False,
         generate_vrd: bool = True,
+        merge_identical_textures: bool = True,
+        max_texture_edge: int = 0,
     ) -> None:
         super().__init__()
         self.pmx_path = Path(pmx_path)
@@ -2837,6 +2841,8 @@ class FullImportWorker(QtCore.QThread):
         self.survivor = normalize_survivor_code(survivor)
         self.copy_to_sfm_usermod = bool(copy_to_sfm_usermod)
         self.nodecal = bool(nodecal)
+        self.merge_identical_textures = bool(merge_identical_textures)
+        self.max_texture_edge = int(max_texture_edge or 0)
         self.generate_vrd = bool(generate_vrd)
         self.bodygroup_scale_factor = float(bodygroup_scale_factor or getattr(core, "DEFAULT_BODYGROUP_SCALE_FACTOR", 40.457))
         self.cancel_requested = False
@@ -3108,8 +3114,8 @@ class FullImportWorker(QtCore.QThread):
                 self._optional(11, "Sort VRD", run_vrd)
 
             def run_textures() -> None:
-                textures_analysis = core.analyze_textures(material_apply.materials_json_path, progress=self._log, cancel_check=self._cancelled, game=self.game)
-                textures = core.process_textures(material_apply.materials_json_path, textures_analysis.plan, progress=self._log, cancel_check=self._cancelled, game=self.game)
+                textures_analysis = core.analyze_textures(material_apply.materials_json_path, progress=self._log, cancel_check=self._cancelled, game=self.game, max_texture_edge=self.max_texture_edge)
+                textures = core.process_textures(material_apply.materials_json_path, textures_analysis.plan, progress=self._log, cancel_check=self._cancelled, game=self.game, max_texture_edge=self.max_texture_edge)
                 validation = textures.report.get("validation") if isinstance(textures.report.get("validation"), dict) else {"ok": True}
                 if validation.get("ok") is False:
                     raise RuntimeError("Texture processing validation failed.")
@@ -3160,6 +3166,7 @@ class FullImportWorker(QtCore.QThread):
             qc_plan["copy_to_gmod_addons"] = True
             qc_plan["copy_to_sfm_usermod"] = bool(self.copy_to_sfm_usermod)
             qc_plan["nodecal"] = bool(self.nodecal)
+            qc_plan["merge_identical_textures"] = bool(self.merge_identical_textures)
             qc_plan["distribution_output_dir"] = self.distribution_output_dir
             qc_result = core.compile_and_compose_qc(proportion_result.final_dir, qc_plan, progress=self._log, cancel_check=self._cancelled)
             validation = qc_result.report.get("validation") if isinstance(qc_result.report.get("validation"), dict) else {}
@@ -4158,6 +4165,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self._refresh_gmod_only_visibility()
         self._refresh_nodecal_checks_for_game()
         self._refresh_experimental_arms_check()
+        self._refresh_merge_textures_checks()
         # On a live target-game switch (not during initial construction): relabel all
         # GMod<->L4D2 brand text and load the studiomdl path saved for the now-selected game.
         if getattr(self, "_i18n_initialized", False):
@@ -4303,6 +4311,76 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.settings_store.setValue("carms_experimental_arms", checked)
         if getattr(self, "current_qc_plan", None):
             self.current_qc_plan["gmod_experimental_arms"] = checked
+
+    def current_merge_textures_enabled(self) -> bool:
+        """'Merge identical textures' toggle: dedupe byte-identical VTFs + drop unused-material VTFs.
+        Single global setting (all games), default ON."""
+        return self.settings_bool(self.settings_store.value("merge_identical_textures", True), True)
+
+    def _refresh_merge_textures_checks(self) -> None:
+        """Sync both 'merge identical textures' checkboxes (main tab + Step 12) to the stored value."""
+        value = self.current_merge_textures_enabled()
+        for attr in ("main_merge_textures_check", "texture_merge_textures_check"):
+            check = getattr(self, attr, None)
+            if isinstance(check, QtWidgets.QCheckBox):
+                blocker = QtCore.QSignalBlocker(check)
+                try:
+                    check.setChecked(value)
+                finally:
+                    del blocker
+
+    def on_merge_textures_toggled(self, checked: bool) -> None:
+        """Keep the two 'merge identical textures' checkboxes in sync, remember the choice, and
+        update the live QC plan."""
+        checked = bool(checked)
+        for attr in ("main_merge_textures_check", "texture_merge_textures_check"):
+            check = getattr(self, attr, None)
+            if isinstance(check, QtWidgets.QCheckBox) and check.isChecked() != checked:
+                blocker = QtCore.QSignalBlocker(check)
+                try:
+                    check.setChecked(checked)
+                finally:
+                    del blocker
+        self.settings_store.setValue("merge_identical_textures", checked)
+        if getattr(self, "current_qc_plan", None):
+            self.current_qc_plan["merge_identical_textures"] = checked
+
+    def current_texture_max_edge(self) -> int:
+        """Step-12 'Max texture size' choice (longest edge, px). Reads the live combo, falling back
+        to the stored value; 4096 (GMod default) means no override -> byte-identical output."""
+        combo = getattr(self, "texture_max_edge_combo", None)
+        if isinstance(combo, QtWidgets.QComboBox) and combo.currentData() is not None:
+            try:
+                return int(combo.currentData())
+            except (TypeError, ValueError):
+                pass
+        try:
+            return int(self.settings_store.value("texture_max_edge", 4096))
+        except (TypeError, ValueError):
+            return 4096
+
+    def _refresh_texture_max_edge_combo(self) -> None:
+        """Sync the 'Max texture size' combo to the stored value."""
+        combo = getattr(self, "texture_max_edge_combo", None)
+        if not isinstance(combo, QtWidgets.QComboBox):
+            return
+        try:
+            stored = int(self.settings_store.value("texture_max_edge", 4096))
+        except (TypeError, ValueError):
+            stored = 4096
+        index = combo.findData(stored)
+        if index < 0:
+            index = combo.findData(4096)
+        if index >= 0:
+            blocker = QtCore.QSignalBlocker(combo)
+            try:
+                combo.setCurrentIndex(index)
+            finally:
+                del blocker
+
+    def on_texture_max_edge_changed(self) -> None:
+        """Remember the 'Max texture size' choice."""
+        self.settings_store.setValue("texture_max_edge", self.current_texture_max_edge())
 
     def _studiomdl_setting_key(self, base: str, game: str | None = None) -> str:
         """Per-game QSettings key for a studiomdl/install path. GMod keeps the legacy key for
@@ -6162,6 +6240,12 @@ class ImporterWindow(QtWidgets.QMainWindow):
             "Default on for Left 4 Dead 2 (decals look wrong on a custom anime survivor), off for Garry's Mod. "
             "Mirrors the same checkbox on the Step 12 texture tab."
         )
+        self.main_merge_textures_check = QtWidgets.QCheckBox("Merge identical textures")
+        self.main_merge_textures_check.setToolTip(
+            "Reduces addon size: byte-identical textures are written as a single VTF (the other "
+            "materials' VMTs point $basetexture/$bumpmap at the shared one), and VTFs for materials "
+            "the compiled model does not use are skipped. Default on. Mirrors the Step 12 texture tab."
+        )
         self.main_scale_spin = QtWidgets.QDoubleSpinBox()
         self.main_scale_spin.setRange(0.01, 10.0)
         self.main_scale_spin.setDecimals(3)
@@ -6209,6 +6293,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         # Spanning row (no separate label) so hiding the checkbox collapses the whole row for SFM.
         form.addRow(self.main_nodecal_check)
         self.main_nodecal_check.toggled.connect(self.on_nodecal_toggled)
+        form.addRow(self.main_merge_textures_check)
+        self.main_merge_textures_check.toggled.connect(self.on_merge_textures_toggled)
         # SFM-only auto-port option (shown only in SFM mode by _refresh_gmod_only_visibility).
         self.main_copy_to_sfm_usermod_check = QtWidgets.QCheckBox("Put into SFM usermod (loose files)")
         self.main_copy_to_sfm_usermod_check.setChecked(True)
@@ -9343,6 +9429,17 @@ class ImporterWindow(QtWidgets.QMainWindow):
             "Metallic/roughness are approximated through Source's phong shader; no $envmap is used."
         )
         settings.addRow("Texture scheme", self.texture_scheme_combo)
+        self.texture_max_edge_combo = QtWidgets.QComboBox()
+        for edge_label, edge_value in (("4096 px (default)", 4096), ("2048 px", 2048), ("1024 px", 1024)):
+            self.texture_max_edge_combo.addItem(edge_label, edge_value)
+        self.texture_max_edge_combo.setToolTip(
+            "Longest-edge size limit applied to every baked texture (base / normal / phong-exp / "
+            "self-illum). Smaller caps shrink the addon file size and VRAM use, at the cost of texture "
+            "detail. 4096 is the Garry's Mod default; Left 4 Dead 2 always clamps to 2048 max (engine "
+            "limit), so a higher choice there has no effect."
+        )
+        self.texture_max_edge_combo.currentIndexChanged.connect(lambda _index: self.on_texture_max_edge_changed())
+        settings.addRow("Max texture size", self.texture_max_edge_combo)
         self.texture_scheme_hint = QtWidgets.QLabel(
             "Pick a scheme and click Analyze Textures to scan for PBR maps. Every extra map is "
             "off by default (matching auto-port); enable the ones you want per material, then Process."
@@ -9357,6 +9454,14 @@ class ImporterWindow(QtWidgets.QMainWindow):
         )
         settings.addRow(self.texture_nodecal_check)
         self.texture_nodecal_check.toggled.connect(self.on_nodecal_toggled)
+        self.texture_merge_textures_check = QtWidgets.QCheckBox("Merge identical textures")
+        self.texture_merge_textures_check.setToolTip(
+            "Reduces addon size: byte-identical textures share a single VTF (other materials' VMTs "
+            "reference it), and VTFs for materials the compiled model does not use are skipped. "
+            "Default on. Mirrors the same checkbox on the main tab."
+        )
+        settings.addRow(self.texture_merge_textures_check)
+        self.texture_merge_textures_check.toggled.connect(self.on_merge_textures_toggled)
         self.detect_texture_mapping_button = QtWidgets.QPushButton("Detect Material Mapping")
         self.detect_texture_mapping_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
         settings.addRow("", self.detect_texture_mapping_button)
@@ -10687,6 +10792,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         # $nodecal checkboxes are remembered per game; sync both to the current game's stored value.
         self._refresh_nodecal_checks_for_game()
         self._refresh_experimental_arms_check()
+        self._refresh_merge_textures_checks()
+        self._refresh_texture_max_edge_combo()
         release_input = str(self.settings_store.value("release_input_dir", "", str) or "")
         if release_input and hasattr(self, "release_input_row"):
             self.release_input_row.set_value(release_input)
@@ -12068,6 +12175,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 else True
             ),
             nodecal=self.current_nodecal_enabled(),
+            merge_identical_textures=self.current_merge_textures_enabled(),
+            max_texture_edge=self.current_texture_max_edge(),
             generate_vrd=(
                 # VRD is opt-in for SFM (default off); always generated for GMod/L4D2.
                 bool(self.main_generate_vrd_check.isChecked())
@@ -20266,7 +20375,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.detect_texture_mapping_button.setEnabled(False)
         self.texture_cancel_button.setEnabled(True)
         scheme = self.current_texture_scheme()
-        self.worker = TextureAnalyzeWorker(str(input_path), scheme=scheme, game=self.current_selected_game())
+        self.worker = TextureAnalyzeWorker(str(input_path), scheme=scheme, game=self.current_selected_game(), max_texture_edge=self.current_texture_max_edge())
         self.worker.log.connect(self.append_texture_log)
         self.worker.done.connect(self.texture_analyze_done)
         self.worker.failed.connect(self.texture_failed)
@@ -20342,7 +20451,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.texture_process_button.setEnabled(False)
         self.detect_texture_mapping_button.setEnabled(False)
         self.texture_cancel_button.setEnabled(True)
-        self.worker = TextureProcessWorker(input_raw, deepcopy(self.current_texture_plan), game=self.current_selected_game())
+        self.worker = TextureProcessWorker(input_raw, deepcopy(self.current_texture_plan), game=self.current_selected_game(), max_texture_edge=self.current_texture_max_edge())
         self.worker.log.connect(self.append_texture_log)
         self.worker.done.connect(self.texture_process_done)
         self.worker.failed.connect(self.texture_failed)
@@ -22161,6 +22270,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             )
             self.current_qc_plan["nodecal"] = self.current_nodecal_enabled()
             self.current_qc_plan["gmod_experimental_arms"] = self.current_experimental_arms_enabled()
+            self.current_qc_plan["merge_identical_textures"] = self.current_merge_textures_enabled()
             self.sync_qc_fields_from_plan(self.current_qc_plan)
             self.populate_qc_bone_table()
         self.refresh_qc_preview()
@@ -22615,6 +22725,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         )
         plan["nodecal"] = self.current_nodecal_enabled()
         plan["gmod_experimental_arms"] = self.current_experimental_arms_enabled()
+        plan["merge_identical_textures"] = self.current_merge_textures_enabled()
         qc_dir = Path(str(plan.get("qc_dir") or self.qc_output_edit.text().strip() or ""))
         if qc_dir:
             plan["addon_dir"] = str(qc_dir / model)

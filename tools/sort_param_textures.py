@@ -47,6 +47,25 @@ _ACTIVE_MAX_TEXTURE_EDGE = MAX_TEXTURE_EDGE
 
 def max_texture_edge_for_game(game: str | None) -> int:
     return L4D2_MAX_TEXTURE_EDGE if str(game or "").strip().lower() == "l4d2" else MAX_TEXTURE_EDGE
+
+
+# User-selectable texture-size caps exposed in Step 12 (longest edge, px). 4096 is the GMod default.
+ALLOWED_TEXTURE_EDGES = (4096, 2048, 1024)
+
+
+def resolve_max_texture_edge(game: str | None, user_edge: object) -> int:
+    """Effective longest-edge cap: the user's Step-12 choice, but never above the game's hard cap
+    (L4D2 crashes above 2048). 0/blank/invalid -> the game default (keeps the old output byte-identical)."""
+    game_cap = max_texture_edge_for_game(game)
+    try:
+        chosen = int(user_edge or 0)
+    except (TypeError, ValueError):
+        chosen = 0
+    if chosen > 0:
+        return min(chosen, game_cap)
+    return game_cap
+
+
 GENERATE_NORMAL_MIN_EDGE = 1024
 SMARTNORMAL_BIAS = 85
 NORMAL_REFERENCE_INTENSITY = 85.0
@@ -913,9 +932,9 @@ def save_normal_png(input_path: Path, output_path: Path) -> tuple[tuple[int, int
     return original_size, image.size, resized
 
 
-def analyze_textures(input_path: Path, analysis_json: Path, plan_json: Path, scheme: str = PBR_SCHEME_LEGACY, game: str = "gmod") -> dict[str, Any]:
+def analyze_textures(input_path: Path, analysis_json: Path, plan_json: Path, scheme: str = PBR_SCHEME_LEGACY, game: str = "gmod", max_texture_edge: int = 0) -> dict[str, Any]:
     global _ACTIVE_MAX_TEXTURE_EDGE
-    _ACTIVE_MAX_TEXTURE_EDGE = max_texture_edge_for_game(game)
+    _ACTIVE_MAX_TEXTURE_EDGE = resolve_max_texture_edge(game, max_texture_edge)
     scheme = normalize_scheme(scheme)
     materials, workspace_root, material_dir, materials_json = load_material_entries(input_path)
     output_dir = workspace_root / "12_param_texture_render_materials"
@@ -1055,6 +1074,8 @@ def analyze_textures(input_path: Path, analysis_json: Path, plan_json: Path, sch
         "normal_dir": str(normal_dir),
         "phongexp_dir": str(phongexp_dir),
         "selfillum_dir": str(selfillum_dir),
+        # User-selected longest-edge cap (0 = game default); process mode reuses this if not overridden.
+        "max_texture_edge": int(max_texture_edge or 0),
         "rows": rows,
     }
     analysis_json.parent.mkdir(parents=True, exist_ok=True)
@@ -1065,12 +1086,15 @@ def analyze_textures(input_path: Path, analysis_json: Path, plan_json: Path, sch
     return analysis
 
 
-def process_textures(input_path: Path, plan_json: Path, report_json: Path, manifest_json: Path, scheme: str | None = None, game: str | None = None) -> dict[str, Any]:
+def process_textures(input_path: Path, plan_json: Path, report_json: Path, manifest_json: Path, scheme: str | None = None, game: str | None = None, max_texture_edge: int = 0) -> dict[str, Any]:
     global _ACTIVE_MAX_TEXTURE_EDGE
     plan = json.loads(plan_json.read_text(encoding="utf-8"))
-    # L4D2 clamps every texture to 2048px (the game crashes on larger maps); GMod keeps 4096.
+    # L4D2 clamps every texture to 2048px (the game crashes on larger maps); GMod default is 4096, and
+    # the Step-12 "max texture size" setting can cap lower. Prefer the passed value, else the one the
+    # plan was analyzed with, then clamp to the game's hard cap.
     effective_game = game if game is not None else plan.get("game")
-    _ACTIVE_MAX_TEXTURE_EDGE = max_texture_edge_for_game(effective_game)
+    user_edge = int(max_texture_edge or 0) or int(plan.get("max_texture_edge") or 0)
+    _ACTIVE_MAX_TEXTURE_EDGE = resolve_max_texture_edge(effective_game, user_edge)
     rows = [row for row in plan.get("rows", []) if isinstance(row, dict)]
     output_dir = Path(str(plan.get("output_dir") or report_json.parent))
     png_dir = Path(str(plan.get("png_dir") or output_dir / "png"))
@@ -1305,15 +1329,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--manifest-json", type=Path)
     parser.add_argument("--scheme", default=None, help="PBR texture scheme (legacy, unreal_wuwa, unity_endfield). Process mode falls back to the plan's stored scheme when omitted.")
     parser.add_argument("--game", default="gmod", help="Target game; 'l4d2' clamps every texture to 2048px (the game crashes on larger maps). Default 'gmod' keeps the 4096 cap.")
+    parser.add_argument("--max-texture-edge", type=int, default=0, help="Longest-edge cap in px (4096/2048/1024). 0 = game default (4096 GMod / 2048 L4D2). Never exceeds the game's hard cap.")
     args = parser.parse_args(argv)
     if args.mode == "analyze":
         if not args.analysis_json:
             parser.error("--analysis-json is required for analyze mode")
-        analyze_textures(args.input, args.analysis_json, args.plan_json, scheme=args.scheme or PBR_SCHEME_LEGACY, game=args.game)
+        analyze_textures(args.input, args.analysis_json, args.plan_json, scheme=args.scheme or PBR_SCHEME_LEGACY, game=args.game, max_texture_edge=args.max_texture_edge)
         return 0
     if not args.report_json or not args.manifest_json:
         parser.error("--report-json and --manifest-json are required for process mode")
-    process_textures(args.input, args.plan_json, args.report_json, args.manifest_json, scheme=args.scheme, game=args.game)
+    process_textures(args.input, args.plan_json, args.report_json, args.manifest_json, scheme=args.scheme, game=args.game, max_texture_edge=args.max_texture_edge)
     return 0
 
 

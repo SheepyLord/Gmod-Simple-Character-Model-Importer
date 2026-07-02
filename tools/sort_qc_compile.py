@@ -3533,11 +3533,18 @@ def write_vmt(
     selfillum_mask: str | None = None,
     game: str = "gmod",
     nodecal: bool = False,
+    base_name: str | None = None,
+    normal_name: str | None = None,
 ) -> None:
     target = normalize_game(game)
     sfm = target == "sfm"
     shared = l4d2_shared_material_root(author, model_name, game)
-    bump = f"models/{author}/{model_name}/{material_name}_n" if has_normal else f"{shared}/normal"
+    # base_name / normal_name let a de-duplicated material point its $basetexture / $bumpmap at
+    # another material's shared VTF (merge-identical-textures). Default to this material's own name,
+    # which keeps the VMT byte-identical to before.
+    base_name = base_name or material_name
+    normal_name = normal_name or material_name
+    bump = f"models/{author}/{model_name}/{normal_name}_n" if has_normal else f"{shared}/normal"
     # A per-material phong-exponent map (Step 12 PBR scheme) carries gloss in
     # red and metallic in alpha, replacing the shared static exponent. When
     # absent (legacy/auto-port), fall back to the shared texture so the VMT is
@@ -3550,7 +3557,7 @@ def write_vmt(
     body = (
         "VertexLitGeneric\n"
         "{\n"
-        f'\t$basetexture "models/{author}/{model_name}/{material_name}"\n'
+        f'\t$basetexture "models/{author}/{model_name}/{base_name}"\n'
         f'\t$bumpmap "{bump}"\n'
         '\t$nocull "1"\n'
     )
@@ -3590,13 +3597,46 @@ def write_vmt(
     path.write_text(body, encoding="utf-8")
 
 
-def compose_materials(plan: dict[str, Any], addon_dir: Path) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+def parse_used_materials(compile_outputs: list[str]) -> set[str]:
+    """Material names studiomdl actually processed, from its 'Processing LOD for material: X' lines,
+    normalized (safe_name + lower) to match the VMT filenames. Union across every compiled model
+    (main / player / c_arms) so a material used by ANY of them is never treated as unused."""
+    used: set[str] = set()
+    for output in compile_outputs:
+        for match in re.finditer(r"Processing LOD for material:\s*(.+)", str(output or "")):
+            name = match.group(1).strip()
+            if name:
+                used.add(safe_name(name, "material").lower())
+    return used
+
+
+def _texture_md5(path: Path) -> str | None:
+    """Content checksum of a texture PNG (used to merge byte-identical textures). None on error."""
+    try:
+        digest = hashlib.md5()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:
+        return None
+
+
+def compose_materials(
+    plan: dict[str, Any],
+    addon_dir: Path,
+    used_materials: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     author = str(plan["author"])
     model = str(plan["model_name"])
     game = normalize_game(plan.get("game"))
     # $nodecal toggle (set by the GUI); falls back to the game default (on for L4D2) when the plan
     # predates the key, so old/external plans still get the expected behavior.
     nodecal = bool(plan.get("nodecal", game == "l4d2"))
+    # Merge-identical-textures toggle (Step 12 / main interface, default on): dedupe byte-identical
+    # textures to a single VTF (the VMT references the shared one) AND drop VTFs for materials the
+    # compiled model never uses. Off -> byte-identical to the old per-material output.
+    merge = bool(plan.get("merge_identical_textures", True))
     out_dir = addon_dir / "materials" / "models" / author / model
     out_dir.mkdir(parents=True, exist_ok=True)
     warnings: list[str] = []
@@ -3605,18 +3645,65 @@ def compose_materials(plan: dict[str, Any], addon_dir: Path) -> tuple[list[dict[
     vtfcmd = find_vtfcmd()
     if vtfcmd is None:
         warnings.append("VTFCmd.exe was not found; material VTF files were not generated.")
-    for row in plan.get("material_rows", []):
-        if not isinstance(row, dict):
-            continue
-        material_name = safe_name(str(row.get("output_name") or row.get("material_name") or "material"), "material")
+
+    def row_name(row: dict[str, Any]) -> str:
+        return safe_name(str(row.get("output_name") or row.get("material_name") or "material"), "material")
+
+    rows = [row for row in plan.get("material_rows", []) if isinstance(row, dict)]
+
+    # Drop materials the compiled model(s) don't reference (e.g. a bodygroup the user removed while
+    # editing). Safe: only when merging is on AND we actually parsed a non-empty used set (otherwise
+    # keep everything). Done BEFORE building the dedupe map so a kept material never references a
+    # dropped material's texture.
+    if merge and used_materials:
+        kept_rows: list[dict[str, Any]] = []
+        dropped_names: list[str] = []
+        for row in rows:
+            if row_name(row).lower() in used_materials:
+                kept_rows.append(row)
+            else:
+                dropped_names.append(row_name(row))
+        rows = kept_rows
+        if dropped_names:
+            emit(f"Merge textures: skipping {len(dropped_names)} unused material(s): {', '.join(sorted(dropped_names))}")
+
+    # Per-slot dedupe map: content-checksum -> the FIRST (canonical) material carrying that texture.
+    SLOT_PNG = {"base": "base_png", "normal": "normal_png", "phongexp": "phongexp_png", "selfillum": "selfillum_png"}
+
+    def slot_digest(row: dict[str, Any], slot: str) -> str | None:
+        raw = str(row.get(SLOT_PNG[slot]) or "").strip()
+        if not raw:
+            return None
+        path = Path(raw)
+        if not (path.is_file() and path.stat().st_size > 0):
+            return None
+        return _texture_md5(path)
+
+    row_digests = [{slot: slot_digest(row, slot) for slot in SLOT_PNG} for row in rows]
+    canonical: dict[str, dict[str, str]] = {slot: {} for slot in SLOT_PNG}
+    if merge:
+        for row, digests in zip(rows, row_digests):
+            name = row_name(row)
+            for slot, digest in digests.items():
+                if digest:
+                    canonical[slot].setdefault(digest, name)
+    dedup_saved = 0
+
+    for row, digests in zip(rows, row_digests):
+        material_name = row_name(row)
+
+        def canon(slot: str) -> str:
+            digest = digests[slot]
+            return canonical[slot].get(digest, material_name) if (merge and digest) else material_name
+
+        base_canon, normal_canon = canon("base"), canon("normal")
+        phongexp_canon, selfillum_canon = canon("phongexp"), canon("selfillum")
         base_png_raw = str(row.get("base_png") or "").strip()
         normal_png_raw = str(row.get("normal_png") or "").strip()
         phongexp_png_raw = str(row.get("phongexp_png") or "").strip()
         selfillum_png_raw = str(row.get("selfillum_png") or "").strip()
-        base_png = Path(base_png_raw)
-        normal_png = Path(normal_png_raw)
-        phongexp_png = Path(phongexp_png_raw)
-        selfillum_png = Path(selfillum_png_raw)
+        base_png, normal_png = Path(base_png_raw), Path(normal_png_raw)
+        phongexp_png, selfillum_png = Path(phongexp_png_raw), Path(selfillum_png_raw)
         base_vtf = out_dir / f"{material_name}.vtf"
         normal_vtf = out_dir / f"{material_name}_n.vtf"
         phongexp_vtf = out_dir / f"{material_name}_exp.vtf"
@@ -3624,8 +3711,12 @@ def compose_materials(plan: dict[str, Any], addon_dir: Path) -> tuple[list[dict[
         has_normal = False
         phongexp_texture: str | None = None
         selfillum_mask: str | None = None
+        # BASE: only the canonical material writes its own VTF; a duplicate emits nothing and its
+        # VMT points $basetexture at the canonical below.
         try:
-            if vtfcmd and base_png_raw and base_png.is_file():
+            if base_canon != material_name:
+                dedup_saved += 1
+            elif vtfcmd and base_png_raw and base_png.is_file():
                 converted = convert_one_vtf(vtfcmd, base_png, out_dir)
                 if converted != base_vtf and converted.exists():
                     converted.replace(base_vtf)
@@ -3635,37 +3726,56 @@ def compose_materials(plan: dict[str, Any], addon_dir: Path) -> tuple[list[dict[
         except Exception as exc:
             warnings.append(str(exc))
         try:
-            if vtfcmd and normal_png_raw and normal_png.is_file() and normal_png.stat().st_size > 0:
-                converted = convert_one_vtf(vtfcmd, normal_png, out_dir)
-                if converted != normal_vtf and converted.exists():
-                    converted.replace(normal_vtf)
-                has_normal = normal_vtf.exists()
-                files.append(file_row(normal_vtf, "normal_vtf"))
+            if normal_png_raw and normal_png.is_file() and normal_png.stat().st_size > 0:
+                has_normal = True
+                if normal_canon != material_name:
+                    dedup_saved += 1
+                elif vtfcmd:
+                    converted = convert_one_vtf(vtfcmd, normal_png, out_dir)
+                    if converted != normal_vtf and converted.exists():
+                        converted.replace(normal_vtf)
+                    has_normal = normal_vtf.exists()
+                    files.append(file_row(normal_vtf, "normal_vtf"))
         except Exception as exc:
             warnings.append(str(exc))
         try:
-            if vtfcmd and phongexp_png_raw and phongexp_png.is_file() and phongexp_png.stat().st_size > 0:
-                converted = convert_one_vtf(vtfcmd, phongexp_png, out_dir)
-                if converted != phongexp_vtf and converted.exists():
-                    converted.replace(phongexp_vtf)
-                if phongexp_vtf.exists():
-                    phongexp_texture = f"models/{author}/{model}/{material_name}_exp"
-                    files.append(file_row(phongexp_vtf, "phongexp_vtf"))
+            if phongexp_png_raw and phongexp_png.is_file() and phongexp_png.stat().st_size > 0:
+                phongexp_texture = f"models/{author}/{model}/{phongexp_canon}_exp"
+                if phongexp_canon != material_name:
+                    dedup_saved += 1
+                elif vtfcmd:
+                    converted = convert_one_vtf(vtfcmd, phongexp_png, out_dir)
+                    if converted != phongexp_vtf and converted.exists():
+                        converted.replace(phongexp_vtf)
+                    if phongexp_vtf.exists():
+                        files.append(file_row(phongexp_vtf, "phongexp_vtf"))
+                    else:
+                        phongexp_texture = None
         except Exception as exc:
             warnings.append(str(exc))
         try:
-            if vtfcmd and selfillum_png_raw and selfillum_png.is_file() and selfillum_png.stat().st_size > 0:
-                converted = convert_one_vtf(vtfcmd, selfillum_png, out_dir)
-                if converted != selfillum_vtf and converted.exists():
-                    converted.replace(selfillum_vtf)
-                if selfillum_vtf.exists():
-                    selfillum_mask = f"models/{author}/{model}/{material_name}_selfillum"
-                    files.append(file_row(selfillum_vtf, "selfillum_vtf"))
+            if selfillum_png_raw and selfillum_png.is_file() and selfillum_png.stat().st_size > 0:
+                selfillum_mask = f"models/{author}/{model}/{selfillum_canon}_selfillum"
+                if selfillum_canon != material_name:
+                    dedup_saved += 1
+                elif vtfcmd:
+                    converted = convert_one_vtf(vtfcmd, selfillum_png, out_dir)
+                    if converted != selfillum_vtf and converted.exists():
+                        converted.replace(selfillum_vtf)
+                    if selfillum_vtf.exists():
+                        files.append(file_row(selfillum_vtf, "selfillum_vtf"))
+                    else:
+                        selfillum_mask = None
         except Exception as exc:
             warnings.append(str(exc))
         vmt = out_dir / f"{material_name}.vmt"
-        write_vmt(vmt, author, model, material_name, has_normal, phongexp_texture, selfillum_mask, game=game, nodecal=nodecal)
+        write_vmt(
+            vmt, author, model, material_name, has_normal, phongexp_texture, selfillum_mask,
+            game=game, nodecal=nodecal, base_name=base_canon, normal_name=normal_canon,
+        )
         files.append(file_row(vmt, "material_vmt"))
+    if merge and dedup_saved:
+        emit(f"Merge textures: {dedup_saved} duplicate texture(s) share an existing VTF (no extra file written).")
     shared_src = ROOT / "reference" / "li_zhiyan_npc" / "a_pack" / "materials" / "models" / "sheepylord" / "shared"
     # Mirror l4d2_shared_material_root(): per-model for L4D2 (self-contained, no cross-addon
     # conflict), author-level for GMod (byte-identical).
@@ -4833,13 +4943,19 @@ def compose(plan_path: Path) -> dict[str, Any]:
         suffix_text = f"_{suffix}" if suffix else ""
         return qc_dir / f"{stem}{suffix_text}.log"
 
+    # StudioMDL output of the successful compile pass, used to learn which materials the model
+    # actually references ('Processing LOD for material: X') so compose_materials can drop unused ones.
+    compile_material_outputs: list[str] = []
+
     def compile_all_models(log_suffix: str = "") -> None:
+        compile_material_outputs.clear()
         emit("Compiling main model.")
         _main_output, main_repaired = compile_with_definebone_repair(
             f"main{('_' + log_suffix) if log_suffix else ''}",
             main_qc,
             compile_log_path("compile_main", log_suffix),
         )
+        compile_material_outputs.append(_main_output)
         pm_repaired = False
         if not single_model:
             emit("Compiling player model.")
@@ -4848,6 +4964,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
                 pm_qc,
                 compile_log_path("compile_pm", log_suffix),
             )
+            compile_material_outputs.append(_pm_output)
         if pm_repaired:
             emit("Recompiling main model after player-model definebone repair.")
             _main_output, _main_repaired_after_pm = compile_with_definebone_repair(
@@ -4855,6 +4972,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
                 main_qc,
                 compile_log_path("compile_main_after_definebone_repair", log_suffix),
             )
+            compile_material_outputs.append(_main_output)
         if carms_qc:
             emit("Compiling c_arms model.")
             _carms_output, carms_repaired = compile_with_definebone_repair(
@@ -4862,6 +4980,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
                 carms_qc,
                 compile_log_path("compile_carms", log_suffix),
             )
+            compile_material_outputs.append(_carms_output)
             if carms_repaired:
                 emit("Recompiling main model after c_arms definebone repair.")
                 _main_output, _ = compile_with_definebone_repair(
@@ -4869,12 +4988,14 @@ def compose(plan_path: Path) -> dict[str, Any]:
                     main_qc,
                     compile_log_path("compile_main_after_carms_definebone_repair", log_suffix),
                 )
+                compile_material_outputs.append(_main_output)
                 if not single_model:
                     _pm_output, _ = compile_with_definebone_repair(
                         f"player_after_carms_repair{('_' + log_suffix) if log_suffix else ''}",
                         pm_qc,
                         compile_log_path("compile_pm_after_carms_definebone_repair", log_suffix),
                     )
+                    compile_material_outputs.append(_pm_output)
 
     if not carms_qc and not sfm:
         # SFM does not use c_arms (Step 10 is skipped), so its absence is expected -- no warning.
@@ -4993,7 +5114,8 @@ def compose(plan_path: Path) -> dict[str, Any]:
         compiled_files, compiled_errors = copy_compiled_outputs(compile_game_dir, addon_dir, author, category, stems)
     generated_files.extend(compiled_files)
     errors.extend(compiled_errors)
-    material_files, material_warnings, material_errors = compose_materials(plan, addon_dir)
+    used_materials = parse_used_materials(compile_material_outputs)
+    material_files, material_warnings, material_errors = compose_materials(plan, addon_dir, used_materials)
     generated_files.extend(material_files)
     warnings.extend(material_warnings)
     errors.extend(material_errors)
