@@ -209,6 +209,168 @@ def _preview_debug_log_path() -> Path:
     return Path.home() / ".MMDCharacterImporter" / "logs" / "material_preview_debug.log"
 
 
+# --- Preview renderer selection + GL runtime probe (issue #129) -----------
+# On some machines Qt silently creates its OpenGL contexts through a module
+# PyOpenGL cannot see (e.g. the opengl32sw.dll software rasterizer picked by
+# Qt's GPU heuristics, or an otherwise rejected ICD). Qt's own painting works,
+# but every PyOpenGL call then fails with GLError 1282 ("invalid operation",
+# first hit at glViewport) and the mesh never renders. The probe below detects
+# that mismatch once at startup so the widgets can switch to a pure-QPainter
+# CPU renderer instead of erroring every frame, and the renderer mode lets the
+# user force a specific backend when the automatic pick is wrong.
+
+PREVIEW_RENDERER_CHOICES = ("auto", "desktop", "software", "cpu")
+
+
+def preview_renderer_mode() -> str:
+    """Requested preview renderer: env MCI_PREVIEW_RENDERER overrides the
+    persisted 'preview_renderer' setting; anything unknown means 'auto'."""
+    value = str(os.environ.get("MCI_PREVIEW_RENDERER", "") or "").strip().lower()
+    if value not in PREVIEW_RENDERER_CHOICES:
+        try:
+            value = str(
+                QtCore.QSettings("MMDCharacterImporter", "PortingTool").value("preview_renderer", "auto") or "auto"
+            ).strip().lower()
+        except Exception:
+            value = "auto"
+    return value if value in PREVIEW_RENDERER_CHOICES else "auto"
+
+
+_RENDERER_MODE = preview_renderer_mode()
+_FORCE_CPU_PREVIEW = _RENDERER_MODE == "cpu"
+# In forced-CPU mode the preview widgets never touch OpenGL, so they use plain
+# QWidget: a QOpenGLWidget would still create a (potentially broken) GL
+# context just by existing, which is exactly what "cpu" must avoid.
+_PreviewWidgetBase = QtWidgets.QWidget if _FORCE_CPU_PREVIEW else QOpenGLWidget
+
+
+@dataclass
+class GLRuntimeProbe:
+    ok: bool
+    mode: str
+    detail: str
+    renderer: str = ""
+    vendor: str = ""
+    version: str = ""
+    software_dll_loaded: bool = False
+
+    def summary(self) -> str:
+        state = "ok" if self.ok else "UNAVAILABLE"
+        parts = [f"OpenGL preview backend: {state} (renderer mode: {self.mode})"]
+        if self.renderer or self.vendor or self.version:
+            parts.append(f"GL_RENDERER={self.renderer!r} GL_VENDOR={self.vendor!r} GL_VERSION={self.version!r}")
+        if self.software_dll_loaded:
+            parts.append("Qt is using the opengl32sw.dll software rasterizer")
+        if self.detail:
+            parts.append(self.detail)
+        return " | ".join(parts)
+
+
+_GL_RUNTIME_PROBE: GLRuntimeProbe | None = None
+
+
+def _software_gl_dll_loaded() -> bool:
+    """True when Qt loaded its software OpenGL rasterizer (opengl32sw.dll);
+    PyOpenGL binds the system opengl32.dll, so the two cannot interoperate."""
+    if os.name != "nt":
+        return False
+    try:
+        return bool(ctypes.windll.kernel32.GetModuleHandleW("opengl32sw.dll"))
+    except Exception:
+        return False
+
+
+def probe_gl_runtime() -> GLRuntimeProbe:
+    """Create an offscreen Qt OpenGL context and verify PyOpenGL can drive it.
+
+    Must run on the GUI thread after QApplication exists and before the first
+    preview paints. The result gates gl_runtime_usable(): a failed probe makes
+    every preview widget render through the QPainter CPU fallback instead of
+    raising GLError once per frame (issue #129).
+    """
+    global _GL_RUNTIME_PROBE
+    if _FORCE_CPU_PREVIEW:
+        _GL_RUNTIME_PROBE = GLRuntimeProbe(
+            ok=False, mode=_RENDERER_MODE, detail="CPU renderer forced; OpenGL disabled for previews."
+        )
+        return _GL_RUNTIME_PROBE
+    if GL is None:
+        _GL_RUNTIME_PROBE = GLRuntimeProbe(
+            ok=False, mode=_RENDERER_MODE, detail="PyOpenGL is not installed.",
+            software_dll_loaded=_software_gl_dll_loaded(),
+        )
+        return _GL_RUNTIME_PROBE
+    renderer = vendor = version = ""
+    try:
+        surface = QtGui.QOffscreenSurface()
+        surface.create()
+        if not surface.isValid():
+            raise RuntimeError("Qt could not create an offscreen surface")
+        context = QtGui.QOpenGLContext()
+        if not context.create():
+            raise RuntimeError("Qt could not create an OpenGL context")
+        if not context.makeCurrent(surface):
+            raise RuntimeError("Qt could not make the OpenGL context current")
+        try:
+            # Exercise the exact call that fails on mismatched backends
+            # (glViewport was the first reported error in issue #129) and read
+            # the identity strings for the diagnostics log.
+            def _decode(value: object) -> str:
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", "replace")
+                return str(value) if value else ""
+
+            renderer = _decode(GL.glGetString(GL.GL_RENDERER))
+            vendor = _decode(GL.glGetString(GL.GL_VENDOR))
+            version = _decode(GL.glGetString(GL.GL_VERSION))
+            GL.glViewport(0, 0, 4, 4)
+            GL.glClearColor(0.0, 0.0, 0.0, 1.0)
+            error = int(GL.glGetError())
+            if not renderer:
+                raise RuntimeError("PyOpenGL sees no current context (GL_RENDERER is empty)")
+            if error:
+                raise RuntimeError(f"OpenGL reported error 0x{error:04x} during the self-test")
+        finally:
+            context.doneCurrent()
+    except Exception as exc:
+        _GL_RUNTIME_PROBE = GLRuntimeProbe(
+            ok=False,
+            mode=_RENDERER_MODE,
+            detail=f"PyOpenGL cannot drive Qt's OpenGL context: {exc}. Previews use the CPU renderer.",
+            renderer=renderer,
+            vendor=vendor,
+            version=version,
+            software_dll_loaded=_software_gl_dll_loaded(),
+        )
+        return _GL_RUNTIME_PROBE
+    _GL_RUNTIME_PROBE = GLRuntimeProbe(
+        ok=True,
+        mode=_RENDERER_MODE,
+        detail="",
+        renderer=renderer,
+        vendor=vendor,
+        version=version,
+        software_dll_loaded=_software_gl_dll_loaded(),
+    )
+    return _GL_RUNTIME_PROBE
+
+
+def gl_runtime_usable() -> bool:
+    """Whether the widgets may issue PyOpenGL calls. True when the probe has
+    not run (standalone/tests import this module without the GUI startup)."""
+    if _FORCE_CPU_PREVIEW or GL is None:
+        return False
+    return _GL_RUNTIME_PROBE is None or _GL_RUNTIME_PROBE.ok
+
+
+def _cpu_preview_budget() -> int:
+    try:
+        value = int(os.environ.get("MCI_CPU_PREVIEW_BUDGET", "") or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return value if value > 0 else 20000
+
+
 @dataclass
 class PreviewMaterial:
     name: str
@@ -1025,7 +1187,7 @@ def _scalar_float(value: object, default: float = 0.0) -> float:
         return float(default)
 
 
-class StaticModelPreviewWidget(QOpenGLWidget):
+class StaticModelPreviewWidget(_PreviewWidgetBase):
     statsChanged = QtCore.Signal(str)
 
     def __init__(self, parent=None) -> None:
@@ -1051,6 +1213,13 @@ class StaticModelPreviewWidget(QOpenGLWidget):
         self._overlay_error = ""
         self._last_stats_text: str | None = None
         self._vertex_data: np.ndarray | None = None
+        # CPU (QPainter) fallback renderer state (issue #129).
+        self._gl_disabled = False
+        self._gl_failures = 0
+        self._cpu_face_cache: dict[str, object] | None = None
+        self._cpu_tint_cache: dict[Path, tuple[float, float, float]] = {}
+        self._drag_active = False
+        self._last_wheel_time = 0.0
         self._height_meters_per_unit = 0.0
         self._height_up_axis = 1
         self._height_reference_m = HEIGHT_REFERENCE_METERS
@@ -1072,6 +1241,8 @@ class StaticModelPreviewWidget(QOpenGLWidget):
         self._gl_ready = False
         self._gl_error = ""
         self._overlay_error = ""
+        self._cpu_face_cache = None
+        self._cpu_tint_cache = {}
         self.update()
         self._emit_stats()
         return self.model
@@ -1083,6 +1254,8 @@ class StaticModelPreviewWidget(QOpenGLWidget):
         self._gl_ready = False
         self._gl_error = ""
         self._overlay_error = ""
+        self._cpu_face_cache = None
+        self._cpu_tint_cache = {}
         self.update()
         self._emit_stats()
 
@@ -1172,7 +1345,7 @@ class StaticModelPreviewWidget(QOpenGLWidget):
         # A fresh context invalidates previously created texture names.
         self._texture_ids = {}
         self._gl_ready = False
-        if GL:
+        if GL and self._gl_backend_active():
             # Guard these initial GL calls. initializeGL is normally invoked with
             # the context already current, but under some drivers / on context
             # recreation during docking/reparenting the context is not yet current
@@ -1206,8 +1379,24 @@ class StaticModelPreviewWidget(QOpenGLWidget):
                 pass
         self._gl_ready = False
 
+    def _gl_backend_active(self) -> bool:
+        """True while the widget may issue PyOpenGL calls: PyOpenGL imported,
+        the startup probe passed, no local failure latch, and the widget is
+        actually GL-backed (forced-CPU mode uses a plain QWidget base)."""
+        return GL is not None and gl_runtime_usable() and not self._gl_disabled and isinstance(self, QOpenGLWidget)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        if isinstance(self, QOpenGLWidget):
+            super().paintEvent(event)  # drives paintGL
+            return
+        self._render_frame()
+
     def paintGL(self) -> None:
-        if GL:
+        self._render_frame()
+
+    def _render_frame(self) -> None:
+        gl_active = self._gl_backend_active()
+        if gl_active:
             try:
                 GL.glViewport(0, 0, *self._gl_viewport_size())
                 GL.glClearColor(0.08, 0.09, 0.10, 1.0)
@@ -1217,8 +1406,14 @@ class StaticModelPreviewWidget(QOpenGLWidget):
                 # Do not latch a transient failure forever: a successful frame
                 # clears any previous draw error.
                 self._gl_error = ""
+                self._gl_failures = 0
             except Exception as exc:
                 self._gl_error = str(exc)
+                self._gl_failures += 1
+                if self._gl_failures >= 2:
+                    # PyOpenGL cannot drive this Qt context (issue #129): stop
+                    # issuing GL calls and render on the CPU from now on.
+                    self._gl_disabled = True
 
         painter = QtGui.QPainter(self)
         try:
@@ -1227,14 +1422,15 @@ class StaticModelPreviewWidget(QOpenGLWidget):
                 painter.fillRect(self.rect(), QtGui.QColor(22, 24, 27))
                 painter.setPen(QtGui.QColor(230, 230, 230))
                 painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "Select a PMX/VRM model to preview.")
-            elif not GL:
+            elif not gl_active or self._gl_error:
+                # CPU fallback: flat-shaded QPainter mesh so the preview stays
+                # usable when PyOpenGL cannot render (issue #129).
                 painter.fillRect(self.rect(), QtGui.QColor(22, 24, 27))
-                painter.setPen(QtGui.QColor(255, 210, 120))
-                painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "PyOpenGL is required for mesh preview rendering.")
-            elif self._gl_error:
-                painter.fillRect(self.rect(), QtGui.QColor(22, 24, 27))
-                painter.setPen(QtGui.QColor(255, 210, 120))
-                painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "OpenGL preview is unavailable in this context.")
+                try:
+                    self._draw_mesh_painter(painter)
+                except Exception:
+                    painter.setPen(QtGui.QColor(255, 210, 120))
+                    painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "OpenGL preview is unavailable in this context.")
             try:
                 if self.model and (self._show_bones or self._show_bone_names):
                     self._draw_skeleton(painter)
@@ -1253,6 +1449,175 @@ class StaticModelPreviewWidget(QOpenGLWidget):
     def _gl_viewport_size(self) -> tuple[int, int]:
         dpr = max(1.0, float(self.devicePixelRatioF()))
         return max(1, int(round(self.width() * dpr))), max(1, int(round(self.height() * dpr)))
+
+    # --- CPU (QPainter) fallback renderer (issue #129) --------------------
+
+    def _cpu_interactive(self) -> bool:
+        return self._drag_active or (time.monotonic() - self._last_wheel_time) < 0.25
+
+    def _cpu_triangle_budget(self) -> int:
+        budget = _cpu_preview_budget()
+        # Rotating/zooming redraws every event; drop detail to stay responsive
+        # and repaint at full quality once the interaction settles.
+        return max(1500, budget // 4) if self._cpu_interactive() else budget
+
+    def _cpu_material_tint(self, material: PreviewMaterial) -> tuple[float, float, float]:
+        """Average texture color, so the CPU preview keeps hair/cloth hues even
+        though it cannot texture-map. Cached per texture path."""
+        path = material.texture_path
+        if not path:
+            return (1.0, 1.0, 1.0)
+        cached = self._cpu_tint_cache.get(path)
+        if cached is not None:
+            return cached
+        tint = (1.0, 1.0, 1.0)
+        image = self._texture_images.get(path)
+        if image is None and path.exists():
+            image = QtGui.QImage(str(path))
+            image = None if image.isNull() else image
+        if image is not None and not image.isNull():
+            try:
+                mean = image.scaled(
+                    1,
+                    1,
+                    QtCore.Qt.AspectRatioMode.IgnoreAspectRatio,
+                    QtCore.Qt.TransformationMode.SmoothTransformation,
+                ).pixelColor(0, 0)
+                tint = (mean.redF(), mean.greenF(), mean.blueF())
+            except Exception:
+                tint = (1.0, 1.0, 1.0)
+        self._cpu_tint_cache[path] = tint
+        return tint
+
+    def _painter_face_arrays(self) -> dict[str, object]:
+        """Per-model face arrays for the CPU renderer: (F,3) vertex indices,
+        (F,4) flat colors (material diffuse x mean texture color), (F,3) unit
+        face normals in model space. Rebuilt when the model or the
+        hide-missing-texture filter changes."""
+        key = (id(self.model), self._hide_missing_texture_materials)
+        cached = self._cpu_face_cache
+        if cached is not None and cached.get("key") == key:
+            return cached
+        tri_blocks: list[np.ndarray] = []
+        color_blocks: list[np.ndarray] = []
+        model = self.model
+        if model is not None and len(model.indices) >= 3:
+            indices = model.indices
+            for material in model.materials:
+                if self._hide_missing_texture_materials and material.missing_texture:
+                    continue
+                start = int(material.index_start)
+                count = int(material.index_count)
+                if count <= 0 or start >= len(indices):
+                    continue
+                stop = min(len(indices), start + count)
+                block = np.asarray(indices[start:stop], dtype=np.int64)
+                block = block[: (len(block) // 3) * 3].reshape(-1, 3)
+                if not len(block):
+                    continue
+                tint = self._cpu_material_tint(material)
+                diffuse = material.diffuse
+                color = np.array(
+                    [
+                        max(0.0, min(1.0, float(diffuse[0]) * tint[0])),
+                        max(0.0, min(1.0, float(diffuse[1]) * tint[1])),
+                        max(0.0, min(1.0, float(diffuse[2]) * tint[2])),
+                        max(0.25, min(1.0, float(diffuse[3]))),
+                    ],
+                    dtype=np.float32,
+                )
+                tri_blocks.append(block)
+                color_blocks.append(np.repeat(color[None, :], len(block), axis=0))
+        if tri_blocks:
+            tri = np.vstack(tri_blocks)
+            colors = np.vstack(color_blocks)
+            positions = model.positions.astype(np.float64)
+            edge1 = positions[tri[:, 1]] - positions[tri[:, 0]]
+            edge2 = positions[tri[:, 2]] - positions[tri[:, 0]]
+            normals = np.cross(edge1, edge2)
+            lengths = np.linalg.norm(normals, axis=1)
+            normals /= np.maximum(lengths, 1e-12)[:, None]
+        else:
+            tri = np.zeros((0, 3), dtype=np.int64)
+            colors = np.zeros((0, 4), dtype=np.float32)
+            normals = np.zeros((0, 3), dtype=np.float64)
+        cache = {"key": key, "tri": tri, "colors": colors, "normals": normals}
+        self._cpu_face_cache = cache
+        return cache
+
+    def _draw_mesh_painter(self, painter: QtGui.QPainter) -> None:
+        model = self.model
+        if model is None or len(model.positions) == 0:
+            return
+        faces = self._painter_face_arrays()
+        tri = faces["tri"]
+        if not len(tri):
+            return
+        projection, view = self._projection_view_matrices()
+        positions = model.positions.astype(np.float64)
+        homogeneous = np.concatenate([positions, np.ones((len(positions), 1), dtype=np.float64)], axis=1)
+        clip = ((projection @ view) @ homogeneous.T).T
+        safe_w = np.where(np.abs(clip[:, 3]) <= 1e-8, 1.0, clip[:, 3])
+        ndc = clip[:, :3] / safe_w[:, None]
+        sx = self.width() * (0.5 + ndc[:, 0] * 0.5)
+        sy = self.height() * (0.5 - ndc[:, 1] * 0.5)
+        depth = ndc[:, 2]
+
+        face_depth = (depth[tri[:, 0]] + depth[tri[:, 1]] + depth[tri[:, 2]]) / 3.0
+        x0, y0 = sx[tri[:, 0]], sy[tri[:, 0]]
+        x1, y1 = sx[tri[:, 1]], sy[tri[:, 1]]
+        x2, y2 = sx[tri[:, 2]], sy[tri[:, 2]]
+        area = np.abs((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0))
+        budget = self._cpu_triangle_budget()
+        if len(tri) > budget:
+            # Keep the largest on-screen triangles: the silhouette and big
+            # surfaces survive, sub-pixel detail is dropped.
+            keep = np.argpartition(area, len(area) - budget)[-budget:]
+        else:
+            keep = np.arange(len(tri))
+        order = keep[np.argsort(face_depth[keep])[::-1]]  # far-to-near
+
+        # Headlight shading like the GL path: 0.38 ambient + two-sided diffuse.
+        rotation = view[:3, :3]
+        view_normals = faces["normals"] @ rotation.T
+        shade = np.clip(0.38 + 0.85 * np.abs(view_normals[:, 2]), 0.0, 1.0)
+        colors = faces["colors"]
+        shade_q = np.round(shade * 15.0) / 15.0  # quantize to reuse brushes
+        rgb = np.clip(colors[:, :3] * shade_q[:, None] * 255.0, 0.0, 255.0).astype(np.int32)
+        alpha = np.clip(colors[:, 3] * 255.0, 0.0, 255.0).astype(np.int32)
+
+        xs = sx.tolist()
+        ys = sy.tolist()
+        tri_list = tri.tolist()
+        point = QtCore.QPointF
+        polygon_cls = QtGui.QPolygonF
+        painter.save()
+        try:
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+            wireframe = self._show_wireframe
+            if wireframe:
+                painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            else:
+                painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            last_key: tuple[int, int, int, int] | None = None
+            for face_index in order.tolist():
+                ia, ib, ic = tri_list[face_index]
+                color_key = (rgb[face_index, 0], rgb[face_index, 1], rgb[face_index, 2], alpha[face_index])
+                if color_key != last_key:
+                    last_key = color_key
+                    color = QtGui.QColor(int(color_key[0]), int(color_key[1]), int(color_key[2]), int(color_key[3]))
+                    if wireframe:
+                        painter.setPen(QtGui.QPen(color, 1.0))
+                    else:
+                        painter.setBrush(color)
+                painter.drawConvexPolygon(
+                    polygon_cls([point(xs[ia], ys[ia]), point(xs[ib], ys[ib]), point(xs[ic], ys[ic])])
+                )
+        finally:
+            painter.restore()
+        if self._cpu_interactive():
+            # Repaint at full quality shortly after the interaction settles.
+            QtCore.QTimer.singleShot(300, self.update)
 
     def _ensure_textures(self) -> None:
         if self._gl_ready or not GL or not self.model:
@@ -1450,7 +1815,7 @@ class StaticModelPreviewWidget(QOpenGLWidget):
     def _draw_overlay(self, painter: QtGui.QPainter) -> None:
         if not self.model:
             return
-        backend = "OpenGL" if GL and not self._gl_error else ("OpenGL error" if self._gl_error else "No OpenGL")
+        backend = "OpenGL" if self._gl_backend_active() and not self._gl_error else "CPU preview"
         textured = sum(1 for material in self.model.materials if material.texture_path)
         text = (
             f"{self.model.name or self.model.path.stem} | "
@@ -1478,7 +1843,14 @@ class StaticModelPreviewWidget(QOpenGLWidget):
         if not self.model:
             text = "Preview idle"
         else:
-            backend = "OpenGL" if GL and not self._gl_error else ("OpenGL error: " + self._gl_error if self._gl_error else "PyOpenGL unavailable")
+            if self._gl_backend_active() and not self._gl_error:
+                backend = "OpenGL"
+            elif GL is None:
+                backend = "CPU preview (PyOpenGL not installed)"
+            elif self._gl_error:
+                backend = f"CPU preview (OpenGL error: {self._gl_error})"
+            else:
+                backend = "CPU preview (OpenGL unavailable)"
             if self._overlay_error:
                 backend = f"{backend} | overlay error: {self._overlay_error}"
             text = (
@@ -1507,17 +1879,22 @@ class StaticModelPreviewWidget(QOpenGLWidget):
         self._last_mouse_pos = current
         buttons = event.buttons()
         if buttons & QtCore.Qt.MouseButton.LeftButton:
+            self._drag_active = True
             self._view_yaw = _scalar_float(self._view_yaw, math.pi) + float(delta.x()) * 0.008
             self._view_pitch = max(-1.45, min(1.45, _scalar_float(self._view_pitch, 0.0) + float(delta.y()) * 0.008))
             self.update()
         elif buttons & (QtCore.Qt.MouseButton.RightButton | QtCore.Qt.MouseButton.MiddleButton):
+            self._drag_active = True
             self._view_pan += QtCore.QPointF(delta.x(), delta.y())
             self.update()
+        else:
+            self._drag_active = False
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         if not event.buttons():
             self._last_mouse_pos = None
+            self._drag_active = False
             self.unsetCursor()
         super().mouseReleaseEvent(event)
 
@@ -1529,6 +1906,7 @@ class StaticModelPreviewWidget(QOpenGLWidget):
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
         delta = event.angleDelta().y()
         if delta:
+            self._last_wheel_time = time.monotonic()
             self._view_zoom = max(0.2, min(8.0, _scalar_float(self._view_zoom, 1.0) * math.pow(1.0015, float(delta))))
             self.update()
         event.accept()
@@ -2207,7 +2585,7 @@ class SkeletonPlanPreviewWidget(QtWidgets.QWidget):
         event.accept()
 
 
-class MaterialPreviewWidget(QOpenGLWidget):
+class MaterialPreviewWidget(_PreviewWidgetBase):
     """Material-region preview for step 5 scans."""
 
     statsChanged = QtCore.Signal(str)
@@ -2276,6 +2654,11 @@ class MaterialPreviewWidget(QOpenGLWidget):
         self._hovered_uid = ""
         self._gl_error = ""
         self._gl_error_count = 0
+        # CPU (QPainter) fallback renderer state (issue #129).
+        self._gl_disabled = False
+        self._gl_failures = 0
+        self._drag_active = False
+        self._last_wheel_time = 0.0
         self._hover_update_queued = False
         self._texture_uploads_this_frame = 0
         self._texture_uploads_pending = False
@@ -2962,7 +3345,7 @@ class MaterialPreviewWidget(QOpenGLWidget):
             context.aboutToBeDestroyed.connect(self._on_context_about_to_be_destroyed, QtCore.Qt.ConnectionType.DirectConnection)
         # A fresh context invalidates previously created texture names.
         self._material_texture_ids = {}
-        if GL:
+        if GL and self._gl_backend_active():
             try:
                 self.makeCurrent()
             except Exception as exc:
@@ -3013,10 +3396,26 @@ class MaterialPreviewWidget(QOpenGLWidget):
     def _has_drawable_content(self) -> bool:
         return bool(self._material_positions or self._collision_lines or self._bone_lines)
 
+    def _gl_backend_active(self) -> bool:
+        """True while the widget may issue PyOpenGL calls: PyOpenGL imported,
+        the startup probe passed, no local failure latch, and the widget is
+        actually GL-backed (forced-CPU mode uses a plain QWidget base)."""
+        return GL is not None and gl_runtime_usable() and not self._gl_disabled and isinstance(self, QOpenGLWidget)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        if isinstance(self, QOpenGLWidget):
+            super().paintEvent(event)  # drives paintGL
+            return
+        self._render_frame()
+
     def paintGL(self) -> None:
+        self._render_frame()
+
+    def _render_frame(self) -> None:
         self._texture_uploads_this_frame = 0
         self._texture_uploads_pending = False
-        if GL:
+        gl_active = self._gl_backend_active()
+        if gl_active:
             try:
                 GL.glViewport(0, 0, *self._gl_viewport_size())
                 GL.glClearColor(0.08, 0.09, 0.10, 1.0)
@@ -3024,8 +3423,14 @@ class MaterialPreviewWidget(QOpenGLWidget):
                 if self._has_drawable_content():
                     self._draw_mesh_gl()
                     self._gl_error = ""
+                self._gl_failures = 0
             except Exception as exc:
                 self._gl_error = str(exc)
+                self._gl_failures += 1
+                if self._gl_failures >= 2:
+                    # PyOpenGL cannot drive this Qt context (issue #129): stop
+                    # issuing GL calls and render on the CPU from now on.
+                    self._gl_disabled = True
 
         painter = QtGui.QPainter(self)
         try:
@@ -3035,10 +3440,17 @@ class MaterialPreviewWidget(QOpenGLWidget):
                 painter.setPen(QtGui.QColor(230, 230, 230))
                 painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, self._empty_message)
                 return
-            if not GL or self._gl_error:
+            if not gl_active or self._gl_error:
+                # CPU fallback: draw the whole scene (materials, collision,
+                # bones, arcs) with QPainter so Step 8/14 bone/physics editing
+                # stays usable without working OpenGL (issue #129).
                 painter.fillRect(self.rect(), QtGui.QColor(22, 24, 27))
-                painter.setPen(QtGui.QColor(255, 210, 120))
-                painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, self._opengl_unavailable_message)
+                try:
+                    self._draw_scene_painter(painter)
+                except Exception as exc:
+                    self._preview_log(f"CPU fallback draw failed: {exc}")
+                    painter.setPen(QtGui.QColor(255, 210, 120))
+                    painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, self._opengl_unavailable_message)
             self._draw_overlay(painter)
         finally:
             painter.end()
@@ -3049,6 +3461,249 @@ class MaterialPreviewWidget(QOpenGLWidget):
     def _gl_viewport_size(self) -> tuple[int, int]:
         dpr = max(1.0, float(self.devicePixelRatioF()))
         return max(1, int(round(self.width() * dpr))), max(1, int(round(self.height() * dpr)))
+
+    # --- CPU (QPainter) fallback renderer (issue #129) --------------------
+
+    def _cpu_interactive(self) -> bool:
+        return self._drag_active or (time.monotonic() - self._last_wheel_time) < 0.25
+
+    def _cpu_triangle_budget(self) -> int:
+        budget = _cpu_preview_budget()
+        # Rotating/zooming redraws every event; drop detail to stay responsive
+        # and repaint at full quality once the interaction settles.
+        return max(1500, budget // 4) if self._cpu_interactive() else budget
+
+    def _cpu_project(self, positions: np.ndarray, pv: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Project (N,3) world positions to screen x/y plus NDC depth."""
+        pos = np.asarray(positions, dtype=np.float64)[:, :3]
+        homogeneous = np.concatenate([pos, np.ones((len(pos), 1), dtype=np.float64)], axis=1)
+        clip = (pv @ homogeneous.T).T
+        safe_w = np.where(np.abs(clip[:, 3]) <= 1e-8, 1.0, clip[:, 3])
+        ndc = clip[:, :3] / safe_w[:, None]
+        sx = self.width() * (0.5 + ndc[:, 0] * 0.5)
+        sy = self.height() * (0.5 - ndc[:, 1] * 0.5)
+        return sx, sy, ndc[:, 2]
+
+    def _draw_scene_painter(self, painter: QtGui.QPainter) -> None:
+        """Render the whole scene with QPainter when PyOpenGL is unavailable:
+        depth-sorted solid-color materials, highlight outlines, the
+        front-bodygroup pass, collision lines, the bone overlay, and the
+        Step-14 constraint arcs (issue #129)."""
+        projection, view = self._projection_view_matrices()
+        pv = projection @ view
+        self._painter_mesh_pass(painter, pv)
+        self._painter_front_bodygroup_pass(painter, pv)
+        self._painter_collision_pass(painter, pv)
+        self._painter_bone_pass(painter, pv)
+        self._painter_arc_pass(painter, pv)
+        if self._cpu_interactive():
+            # Repaint at full quality shortly after the interaction settles.
+            QtCore.QTimer.singleShot(300, self.update)
+
+    def _painter_mesh_pass(self, painter: QtGui.QPainter, pv: np.ndarray) -> None:
+        blocks: list[np.ndarray] = []
+        color_rows: list[np.ndarray] = []
+        highlight_rows: list[np.ndarray] = []
+        for uid, vertex_data in self._material_vertex_data.items():
+            if not self._material_visible(uid) or len(vertex_data) < 3:
+                continue
+            face_count = len(vertex_data) // 3
+            blocks.append(np.asarray(vertex_data[: face_count * 3, :3], dtype=np.float64))
+            highlighted = self._material_is_highlighted(uid)
+            color = np.array(self._material_rgba(uid, highlighted), dtype=np.float32)
+            color_rows.append(np.repeat(color[None, :], face_count, axis=0))
+            highlight_rows.append(np.full(face_count, highlighted, dtype=bool))
+        if not blocks:
+            return
+        positions = np.vstack(blocks)
+        colors = np.vstack(color_rows)
+        highlighted_faces = np.concatenate(highlight_rows)
+        sx, sy, depth = self._cpu_project(positions, pv)
+        fx = sx.reshape(-1, 3)
+        fy = sy.reshape(-1, 3)
+        face_depth = depth.reshape(-1, 3).mean(axis=1)
+        face_total = len(fx)
+        area = np.abs(
+            (fx[:, 1] - fx[:, 0]) * (fy[:, 2] - fy[:, 0]) - (fx[:, 2] - fx[:, 0]) * (fy[:, 1] - fy[:, 0])
+        )
+        budget = self._cpu_triangle_budget()
+        if face_total > budget:
+            keep = np.argpartition(area, face_total - budget)[-budget:]
+        else:
+            keep = np.arange(face_total)
+        order = keep[np.argsort(face_depth[keep])[::-1]]  # far-to-near
+
+        rgb = np.clip(colors[:, :3] * 255.0, 0.0, 255.0).astype(np.int32)
+        alpha = np.clip(colors[:, 3] * 255.0, 0.0, 255.0).astype(np.int32)
+        fxl = fx.tolist()
+        fyl = fy.tolist()
+        point = QtCore.QPointF
+        polygon_cls = QtGui.QPolygonF
+        wireframe = self._wireframe
+        painter.save()
+        try:
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+            if wireframe:
+                painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            else:
+                painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            last_key: tuple[int, int, int, int] | None = None
+            for face_index in order.tolist():
+                px = fxl[face_index]
+                py = fyl[face_index]
+                color_key = (rgb[face_index, 0], rgb[face_index, 1], rgb[face_index, 2], alpha[face_index])
+                if color_key != last_key:
+                    last_key = color_key
+                    color = QtGui.QColor(int(color_key[0]), int(color_key[1]), int(color_key[2]), int(color_key[3]))
+                    if wireframe:
+                        painter.setPen(QtGui.QPen(color, 1.0))
+                    else:
+                        painter.setBrush(color)
+                painter.drawConvexPolygon(
+                    polygon_cls([point(px[0], py[0]), point(px[1], py[1]), point(px[2], py[2])])
+                )
+            highlight_kept = keep[highlighted_faces[keep]] if not wireframe else np.zeros(0, dtype=np.int64)
+            if len(highlight_kept):
+                # Yellow outline pass matching the GL highlight wireframe.
+                painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                painter.setPen(QtGui.QPen(QtGui.QColor(255, 219, 56, 255), 1.2))
+                for face_index in highlight_kept.tolist():
+                    px = fxl[face_index]
+                    py = fyl[face_index]
+                    painter.drawPolygon(
+                        polygon_cls([point(px[0], py[0]), point(px[1], py[1]), point(px[2], py[2])])
+                    )
+        finally:
+            painter.restore()
+
+    def _painter_front_bodygroup_pass(self, painter: QtGui.QPainter, pv: np.ndarray) -> None:
+        if not self._front_bodygroup:
+            return
+        painter.save()
+        try:
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+            painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            point = QtCore.QPointF
+            polygon_cls = QtGui.QPolygonF
+            for uid, vertex_data in self._material_vertex_data.items():
+                if self._material_bodygroup(uid) != self._front_bodygroup or not self._material_visible(uid):
+                    continue
+                face_count = len(vertex_data) // 3
+                if face_count == 0:
+                    continue
+                red, green, blue, alpha = self._material_rgba(uid, True)
+                painter.setBrush(QtGui.QColor.fromRgbF(red, green, blue, max(0.9, alpha)))
+                sx, sy, depth = self._cpu_project(vertex_data[: face_count * 3, :3], pv)
+                fx = sx.reshape(-1, 3)
+                fy = sy.reshape(-1, 3)
+                face_depth = depth.reshape(-1, 3).mean(axis=1)
+                budget = self._cpu_triangle_budget()
+                if face_count > budget:
+                    area = np.abs(
+                        (fx[:, 1] - fx[:, 0]) * (fy[:, 2] - fy[:, 0]) - (fx[:, 2] - fx[:, 0]) * (fy[:, 1] - fy[:, 0])
+                    )
+                    keep = np.argpartition(area, face_count - budget)[-budget:]
+                else:
+                    keep = np.arange(face_count)
+                fxl = fx.tolist()
+                fyl = fy.tolist()
+                for face_index in keep[np.argsort(face_depth[keep])[::-1]].tolist():
+                    px = fxl[face_index]
+                    py = fyl[face_index]
+                    painter.drawConvexPolygon(
+                        polygon_cls([point(px[0], py[0]), point(px[1], py[1]), point(px[2], py[2])])
+                    )
+        finally:
+            painter.restore()
+
+    def _painter_collision_pass(self, painter: QtGui.QPainter, pv: np.ndarray) -> None:
+        if not self._collision_lines:
+            return
+        painter.save()
+        try:
+            for uid, lines in self._collision_lines.items():
+                if len(lines) < 2:
+                    continue
+                highlighted = uid == self._hovered_collision_uid or uid in self._highlighted_collision_uids
+                if highlighted:
+                    pen = QtGui.QPen(QtGui.QColor.fromRgbF(1.0, 0.78, 0.08, 1.0), 3.0)
+                else:
+                    color = self._collision_colors.get(uid, (0.2, 0.75, 1.0, 0.85))
+                    pen = QtGui.QPen(
+                        QtGui.QColor.fromRgbF(float(color[0]), float(color[1]), float(color[2]), float(color[3])), 1.6
+                    )
+                painter.setPen(pen)
+                sx, sy, _depth = self._cpu_project(lines, pv)
+                segments = [
+                    QtCore.QLineF(float(sx[index]), float(sy[index]), float(sx[index + 1]), float(sy[index + 1]))
+                    for index in range(0, (len(lines) // 2) * 2, 2)
+                ]
+                if segments:
+                    painter.drawLines(segments)
+        finally:
+            painter.restore()
+
+    def _painter_bone_pass(self, painter: QtGui.QPainter, pv: np.ndarray) -> None:
+        if not self._bone_lines:
+            return
+        painter.save()
+        try:
+            for uid, lines in self._bone_lines.items():
+                if len(lines) < 2:
+                    continue
+                group_color = self._bone_group_colors.get(uid)
+                highlighted = uid == self._hovered_bone_uid or uid in self._highlighted_bone_uids or group_color is not None
+                if highlighted:
+                    width = BONE_HIGHLIGHT_LINE_WIDTH
+                    point_radius = BONE_HIGHLIGHT_POINT_SIZE * 0.5
+                    if group_color is not None and uid != self._hovered_bone_uid:
+                        color = QtGui.QColor.fromRgbF(group_color[0], group_color[1], group_color[2], 1.0)
+                    else:
+                        color = QtGui.QColor.fromRgbF(1.0, 0.72, 0.05, 1.0)
+                else:
+                    width = BONE_OVERLAY_LINE_WIDTH
+                    point_radius = BONE_OVERLAY_POINT_SIZE * 0.5
+                    color = QtGui.QColor.fromRgbF(0.78, 0.84, 0.94, 0.86)
+                sx, sy, _depth = self._cpu_project(lines, pv)
+                painter.setPen(QtGui.QPen(color, width))
+                for index in range(0, (len(lines) // 2) * 2, 2):
+                    painter.drawLine(
+                        QtCore.QPointF(float(sx[index]), float(sy[index])),
+                        QtCore.QPointF(float(sx[index + 1]), float(sy[index + 1])),
+                    )
+                painter.setPen(QtCore.Qt.PenStyle.NoPen)
+                painter.setBrush(color)
+                for index in range(len(lines)):
+                    painter.drawEllipse(QtCore.QPointF(float(sx[index]), float(sy[index])), point_radius, point_radius)
+        finally:
+            painter.restore()
+
+    def _painter_arc_pass(self, painter: QtGui.QPainter, pv: np.ndarray) -> None:
+        if not self._constraint_arcs:
+            return
+        axis_colors = {
+            "x": (1.0, 0.38, 0.36, 1.0),
+            "y": (0.42, 1.0, 0.48, 1.0),
+            "z": (0.45, 0.62, 1.0, 1.0),
+        }
+        painter.save()
+        try:
+            for key, arr in self._constraint_arcs.items():
+                if arr is None or len(arr) < 2:
+                    continue
+                color = (0.86, 0.88, 0.94, 1.0)
+                lowered = str(key).lower()
+                for prefix, value in axis_colors.items():
+                    if lowered.startswith(prefix):
+                        color = value
+                        break
+                sx, sy, _depth = self._cpu_project(arr, pv)
+                painter.setPen(QtGui.QPen(QtGui.QColor.fromRgbF(*color), 2.6))
+                painter.drawPolyline(
+                    QtGui.QPolygonF([QtCore.QPointF(float(x), float(y)) for x, y in zip(sx, sy)])
+                )
+        finally:
+            painter.restore()
 
     def _load_texture_image(self, path: Path) -> QtGui.QImage:
         image = QtGui.QImage(str(path))
@@ -3328,11 +3983,12 @@ class MaterialPreviewWidget(QOpenGLWidget):
         visible = sum(int(len(positions) // 3) for uid, positions in self._material_positions.items() if self._material_visible(uid))
         total = sum(int(len(positions) // 3) for positions in self._material_positions.values())
         material_count = len(self._materials)
+        cpu_suffix = "" if self._gl_backend_active() and not self._gl_error else " | CPU preview"
         painter.setPen(QtGui.QColor(235, 235, 235))
         painter.drawText(
             12,
             22,
-            f"{material_count:,} materials | {visible:,}/{total:,} preview triangles | {'wireframe' if self._wireframe else 'colored'}",
+            f"{material_count:,} materials | {visible:,}/{total:,} preview triangles | {'wireframe' if self._wireframe else 'colored'}{cpu_suffix}",
         )
         if self._textured_preview_disabled:
             painter.setPen(QtGui.QColor(255, 210, 120))
@@ -3419,7 +4075,10 @@ class MaterialPreviewWidget(QOpenGLWidget):
         preview = self.scan.get("model_preview") if isinstance(self.scan, dict) else None
         if isinstance(preview, dict):
             source = int(preview.get("source_triangle_count", 0) or 0)
-        self.statsChanged.emit(f"Material preview | {material_count:,} materials | {sampled:,}/{source:,} sampled triangles")
+        cpu_suffix = "" if self._gl_backend_active() and not self._gl_error else " | CPU preview (OpenGL unavailable)"
+        self.statsChanged.emit(
+            f"Material preview | {material_count:,} materials | {sampled:,}/{source:,} sampled triangles{cpu_suffix}"
+        )
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         self._last_mouse_pos = event.position().toPoint()
@@ -3438,17 +4097,22 @@ class MaterialPreviewWidget(QOpenGLWidget):
         self._last_mouse_pos = current
         buttons = event.buttons()
         if buttons & QtCore.Qt.MouseButton.LeftButton:
+            self._drag_active = True
             self._view_yaw = _scalar_float(self._view_yaw, 0.0) + float(delta.x()) * 0.008
             self._view_pitch = max(-math.pi * 0.5 + 0.02, min(math.pi * 0.5 - 0.02, _scalar_float(self._view_pitch, 0.0) + float(delta.y()) * 0.008))
             self.update()
         elif buttons & (QtCore.Qt.MouseButton.RightButton | QtCore.Qt.MouseButton.MiddleButton):
+            self._drag_active = True
             self._view_pan += QtCore.QPointF(delta.x(), delta.y())
             self.update()
+        else:
+            self._drag_active = False
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         if not event.buttons():
             self._last_mouse_pos = None
+            self._drag_active = False
             self.unsetCursor()
         super().mouseReleaseEvent(event)
 
@@ -3460,6 +4124,7 @@ class MaterialPreviewWidget(QOpenGLWidget):
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
         delta = event.angleDelta().y()
         if delta:
+            self._last_wheel_time = time.monotonic()
             self._view_zoom = max(0.2, min(8.0, _scalar_float(self._view_zoom, 1.0) * math.pow(1.0015, float(delta))))
             self.update()
         event.accept()

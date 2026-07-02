@@ -57,6 +57,7 @@ ROOT_DIR = bundled_resource_root()
 
 
 try:
+    import model_preview as model_preview_module
     from model_preview import (
         MaterialPreviewWidget,
         SkeletonPlanPreviewWidget,
@@ -66,6 +67,7 @@ try:
         BLENDER_PREVIEW_METERS_PER_UNIT,
     )
 except Exception:
+    model_preview_module = None  # type: ignore[assignment]
     StaticModelPreviewWidget = None  # type: ignore[assignment]
     SkeletonPlanPreviewWidget = None  # type: ignore[assignment]
     MaterialPreviewWidget = None  # type: ignore[assignment]
@@ -4345,6 +4347,36 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if getattr(self, "current_qc_plan", None):
             self.current_qc_plan["merge_identical_textures"] = checked
 
+    def _refresh_preview_renderer_combo(self) -> None:
+        """Sync the preview 'Renderer' combo to the stored preview_renderer setting (issue #129)."""
+        combo = getattr(self, "main_preview_renderer_combo", None)
+        if not isinstance(combo, QtWidgets.QComboBox):
+            return
+        stored = str(self.settings_store.value("preview_renderer", "auto") or "auto").strip().lower()
+        index = combo.findData(stored)
+        if index < 0:
+            index = combo.findData("auto")
+        if index >= 0:
+            blocker = QtCore.QSignalBlocker(combo)
+            try:
+                combo.setCurrentIndex(index)
+            finally:
+                del blocker
+
+    def on_preview_renderer_changed(self) -> None:
+        """Persist the preview renderer choice. It applies on the next launch:
+        the Qt OpenGL application attributes must be set before the
+        QApplication is created (issue #129)."""
+        combo = getattr(self, "main_preview_renderer_combo", None)
+        if not isinstance(combo, QtWidgets.QComboBox):
+            return
+        value = str(combo.currentData() or "auto")
+        self.settings_store.setValue("preview_renderer", value)
+        self.statusBar().showMessage(
+            self._t("preview.renderer_restart_hint", "Preview renderer change takes effect after restarting the tool."),
+            8000,
+        )
+
     def current_texture_max_edge(self) -> int:
         """Step-12 'Max texture size' choice (longest edge, px). Reads the live combo, falling back
         to the stored value; 4096 (GMod default) means no override -> byte-identical output."""
@@ -5205,6 +5237,28 @@ class ImporterWindow(QtWidgets.QMainWindow):
             widget = getattr(self, attr, None)
             if isinstance(widget, QtWidgets.QAbstractButton):
                 widget.setText(text)
+        if hasattr(self, "main_preview_renderer_label"):
+            self.main_preview_renderer_label.setText(self._t("preview.renderer_label", "Renderer"))
+        renderer_combo = getattr(self, "main_preview_renderer_combo", None)
+        if isinstance(renderer_combo, QtWidgets.QComboBox):
+            renderer_texts = {
+                "auto": self._t("preview.renderer_auto", "Auto"),
+                "desktop": self._t("preview.renderer_desktop", "Desktop OpenGL"),
+                "software": self._t("preview.renderer_software", "Software OpenGL"),
+                "cpu": self._t("preview.renderer_cpu", "CPU (no OpenGL)"),
+            }
+            for item_index in range(renderer_combo.count()):
+                item_text = renderer_texts.get(str(renderer_combo.itemData(item_index) or ""))
+                if item_text:
+                    renderer_combo.setItemText(item_index, item_text)
+            renderer_combo.setToolTip(
+                self._t(
+                    "preview.renderer_tooltip",
+                    "Preview renderer backend for all model previews. If the preview reports an OpenGL error, "
+                    "try 'Desktop OpenGL' (use the GPU driver directly) or 'CPU (no OpenGL)'. "
+                    "Takes effect after restarting the tool.",
+                )
+            )
         if hasattr(self, "main_clear_custom_normals_check"):
             clear_normals_tip = self._t(
                 "main.clear_custom_normals_tip",
@@ -6351,12 +6405,33 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.main_preview_bones_check.setChecked(True)
             self.main_preview_bone_names_check = QtWidgets.QCheckBox("Bone Names")
             self.main_preview_wireframe_check = QtWidgets.QCheckBox("Wireframe")
+            # issue #129: renderer backend override for machines where PyOpenGL
+            # cannot drive Qt's OpenGL context (applied on next launch).
+            self.main_preview_renderer_label = QtWidgets.QLabel(self._t("preview.renderer_label", "Renderer"))
+            self.main_preview_renderer_combo = QtWidgets.QComboBox()
+            for renderer_label, renderer_value in (
+                (self._t("preview.renderer_auto", "Auto"), "auto"),
+                (self._t("preview.renderer_desktop", "Desktop OpenGL"), "desktop"),
+                (self._t("preview.renderer_software", "Software OpenGL"), "software"),
+                (self._t("preview.renderer_cpu", "CPU (no OpenGL)"), "cpu"),
+            ):
+                self.main_preview_renderer_combo.addItem(renderer_label, renderer_value)
+            self.main_preview_renderer_combo.setToolTip(
+                self._t(
+                    "preview.renderer_tooltip",
+                    "Preview renderer backend for all model previews. If the preview reports an OpenGL error, "
+                    "try 'Desktop OpenGL' (use the GPU driver directly) or 'CPU (no OpenGL)'. "
+                    "Takes effect after restarting the tool.",
+                )
+            )
             preview_controls.addWidget(self.main_reload_preview_button)
             preview_controls.addWidget(self.main_reset_preview_button)
             preview_controls.addWidget(self.main_preview_bones_check)
             preview_controls.addWidget(self.main_preview_bone_names_check)
             preview_controls.addWidget(self.main_preview_wireframe_check)
             preview_controls.addStretch(1)
+            preview_controls.addWidget(self.main_preview_renderer_label)
+            preview_controls.addWidget(self.main_preview_renderer_combo)
             preview_layout.addLayout(preview_controls)
             preview_layout.addWidget(self.main_preview_status_label)
             self.main_reload_preview_button.clicked.connect(lambda: self.load_main_preview(silent=False))
@@ -6364,6 +6439,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.main_preview_bones_check.toggled.connect(self.main_model_preview.set_bones_visible)
             self.main_preview_bone_names_check.toggled.connect(self.main_model_preview.set_bone_names_visible)
             self.main_preview_wireframe_check.toggled.connect(self.main_model_preview.set_wireframe_visible)
+            self.main_preview_renderer_combo.currentIndexChanged.connect(lambda _index: self.on_preview_renderer_changed())
         else:
             self.main_model_preview = None
             self.main_preview_status_label = QtWidgets.QLabel("OpenGL preview dependencies are unavailable.")
@@ -10794,6 +10870,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self._refresh_experimental_arms_check()
         self._refresh_merge_textures_checks()
         self._refresh_texture_max_edge_combo()
+        self._refresh_preview_renderer_combo()
         release_input = str(self.settings_store.value("release_input_dir", "", str) or "")
         if release_input and hasattr(self, "release_input_row"):
             self.release_input_row.set_value(release_input)
@@ -23672,9 +23749,37 @@ def main() -> int:
         QtGui.QSurfaceFormat.setDefaultFormat(_gl_format)
     except Exception:
         pass
+    # issue #129: apply the persisted preview renderer preference. Previews can
+    # only use PyOpenGL when Qt's OpenGL module matches the system opengl32.dll,
+    # so 'desktop' pins Qt to the real driver (bypassing Qt's GPU heuristics)
+    # while 'software' pins Qt to its opengl32sw.dll rasterizer (previews then
+    # render on the CPU). Both attributes must be set before the QApplication.
+    if model_preview_module is not None:
+        try:
+            _renderer_mode = model_preview_module.preview_renderer_mode()
+            if _renderer_mode == "desktop":
+                QtCore.QCoreApplication.setAttribute(QtCore.Qt.ApplicationAttribute.AA_UseDesktopOpenGL, True)
+            elif _renderer_mode == "software":
+                QtCore.QCoreApplication.setAttribute(QtCore.Qt.ApplicationAttribute.AA_UseSoftwareOpenGL, True)
+        except Exception:
+            pass
     QtCore.QCoreApplication.setAttribute(QtCore.Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("MMD Character Importer")
+    # issue #129: verify once that PyOpenGL can drive Qt's OpenGL context; on
+    # failure every preview falls back to the QPainter CPU renderer instead of
+    # raising GLError 1282 per frame. Log the result so gui_crash.log reports
+    # carry real renderer diagnostics.
+    if model_preview_module is not None:
+        try:
+            _gl_probe = model_preview_module.probe_gl_runtime()
+            _probe_line = f"[preview] {_gl_probe.summary()}"
+            print(_probe_line)
+            if _CRASH_LOG_HANDLE:
+                _CRASH_LOG_HANDLE.write(_probe_line + "\n")
+                _CRASH_LOG_HANDLE.flush()
+        except Exception:
+            pass
     theme_preference = str(
         QtCore.QSettings("MMDCharacterImporter", "PortingTool").value("ui_theme", "dark") or "dark"
     ).lower()
