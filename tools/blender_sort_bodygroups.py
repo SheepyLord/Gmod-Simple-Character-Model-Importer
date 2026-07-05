@@ -942,6 +942,28 @@ def shape_key_names(obj: bpy.types.Object) -> list[str]:
     return names
 
 
+def shape_key_max_deltas(obj: bpy.types.Object) -> dict[str, float]:
+    """Active shape keys with their max vertex delta (post-scale units), in
+    key-block order. Same active-key filter as shape_key_names()."""
+    keys = obj.data.shape_keys
+    if keys is None:
+        return {}
+    deltas: dict[str, float] = {}
+    for key in keys.key_blocks:
+        base = blender_base_name(str(key.name or "")).strip()
+        if not base or base.lower() == "basis":
+            continue
+        try:
+            delta = float(shapekey_max_delta(obj, key, UNUSED_SHAPEKEY_DELTA_EPSILON))
+        except Exception:
+            # Mirror shape_key_names(): an unreadable key still counts as active.
+            delta = float("inf")
+        if delta <= UNUSED_SHAPEKEY_DELTA_EPSILON:
+            continue
+        deltas[str(key.name)] = delta
+    return deltas
+
+
 def normalized_flex_name(name: str) -> str:
     return re.sub(r"[\s_.\-]+", "", blender_base_name(str(name or "")).lower())
 
@@ -952,6 +974,64 @@ def is_facial_shapekey_name(name: str) -> bool:
     if compact in FACIAL_SHAPEKEY_EXACT_NAMES:
         return True
     return any(hint in lowered or hint in compact for hint in FACIAL_SHAPEKEY_TEXT_HINTS)
+
+
+# --- Step 7 flex dictionary as a facial signal (issue #131) ----------------
+# Step 7 (blender_sort_flexes.py) maps morph names to Source flex names through
+# the bundled corpus dictionary; any shape key that dictionary knows will end up
+# as a facial flex slider, so Step 6 treats it as facial evidence even when the
+# English keyword hints above miss the (often machine-translated) name.
+
+FLEX_NAME_DICTIONARY_PATH = Path(__file__).resolve().parent / "flex_name_dictionary.json"
+_FLEX_DICTIONARY_NAMES: tuple[set[str], set[str]] | None = None
+
+
+def normalized_flex_dictionary_key(name: str) -> str:
+    """Mirror blender_sort_flexes.normalized_name so both steps agree on which
+    morph names the dictionary covers."""
+    text = str(name or "").lower()
+    text = text.replace("左", "left").replace("右", "right")
+    text = text.replace("ω", "omega")
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def flex_dictionary_names() -> tuple[set[str], set[str]]:
+    """(exact, normalized) morph names known to the Step 7 corpus dictionary.
+    Cached; empty when the dictionary is missing (facial detection then relies
+    on the keyword hints alone, as before)."""
+    global _FLEX_DICTIONARY_NAMES
+    if _FLEX_DICTIONARY_NAMES is None:
+        exact: set[str] = set()
+        normalized: set[str] = set()
+        try:
+            data = json.loads(FLEX_NAME_DICTIONARY_PATH.read_text(encoding="utf-8"))
+            mapping = data.get("mapping") if isinstance(data, dict) else None
+            if isinstance(mapping, dict):
+                for key in mapping:
+                    name = str(key)
+                    exact.add(name)
+                    compact = normalized_flex_dictionary_key(name)
+                    if compact:
+                        normalized.add(compact)
+        except Exception:
+            pass
+        _FLEX_DICTIONARY_NAMES = (exact, normalized)
+    return _FLEX_DICTIONARY_NAMES
+
+
+def is_dictionary_flex_shapekey(name: str) -> bool:
+    exact, normalized = flex_dictionary_names()
+    base = blender_base_name(str(name or "")).strip()
+    if not base:
+        return False
+    if base in exact:
+        return True
+    compact = normalized_flex_dictionary_key(base)
+    return bool(compact) and compact in normalized
+
+
+def is_facialish_shapekey_name(name: str) -> bool:
+    return is_facial_shapekey_name(name) or is_dictionary_flex_shapekey(name)
 
 
 def facial_shapekey_names(obj: bpy.types.Object) -> list[str]:
@@ -1134,7 +1214,8 @@ def collect_sources(vertex_limit: int = DEFAULT_SOURCE_VERTEX_LIMIT) -> list[dic
         zero_alpha_materials = [name for name, alpha in material_alphas.items() if alpha <= 0.001]
         default_enabled = not zero_alpha_materials
         tracking = tracking_vertex_groups(obj)
-        shapekey_names = shape_key_names(obj)
+        shapekey_deltas = shape_key_max_deltas(obj)
+        shapekey_names = list(shapekey_deltas.keys())
         facial_names = [name for name in shapekey_names if is_facial_shapekey_name(name)]
         facial_text_hint = has_facial_merge_text_hint(obj, materials, tracking)
         facial_merge_candidate = bool(default_enabled and facial_names)
@@ -1214,6 +1295,10 @@ def collect_sources(vertex_limit: int = DEFAULT_SOURCE_VERTEX_LIMIT) -> list[dic
                 "components": components,
                 "related_vertex_groups": tracking,
                 "shapekey_names": shapekey_names,
+                "shapekey_max_deltas": {
+                    name: (round(delta, 4) if math.isfinite(delta) else 999999.0)
+                    for name, delta in shapekey_deltas.items()
+                },
                 "facial_shapekey_names": facial_names,
                 "facial_merge_candidate": facial_merge_candidate,
                 "facial_merge_text_hint": facial_text_hint,
@@ -1226,7 +1311,176 @@ def collect_sources(vertex_limit: int = DEFAULT_SOURCE_VERTEX_LIMIT) -> list[dic
                 "warnings": warnings,
             }
         )
+    expand_facial_merge_candidates(sources, vertex_limit)
     return sources
+
+
+# Merge evidence must be a REAL facial morph: facial-named (keyword hints or
+# the Step 7 flex dictionary) AND moving the source by at least this many
+# post-scale (Source) units. Real facial morphs move millimetres-to-centimetres
+# (>= ~0.1 units); sloppy PMX morphs leave micrometre residues on unrelated
+# meshes, and whole-body morphs (transformations, breast sliders) are real but
+# not facial-named - both must NOT glue the model into one Face bodygroup.
+FACIAL_MERGE_MIN_KEY_DELTA = 0.05
+# A below-neck source may bootstrap the Face merge only when it clearly IS the
+# face (real faces carry dozens of facial morphs; body parts with a stray
+# facial-named morph carry one or two).
+FACIAL_BOOTSTRAP_MIN_KEYS = 5
+# Overriding the below-neck exclusion needs more than a single shared key:
+# face-skin-in-body materials share whole expression sets (dozens of keys),
+# while hair/body parts brushed by one facial adjuster morph share just one -
+# merging those would cost a real bodygroup to unify a rarely-used slider.
+FACIAL_MERGE_NECK_OVERRIDE_MIN_SHARED = 2
+
+
+def strong_facial_shapekeys(source: dict[str, object]) -> set[str]:
+    """Facial-named shape keys that meaningfully move this source."""
+    deltas = source.get("shapekey_max_deltas")
+    if not isinstance(deltas, dict):
+        return set()
+    out: set[str] = set()
+    for name, delta in deltas.items():
+        try:
+            if float(delta) < FACIAL_MERGE_MIN_KEY_DELTA:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if is_facialish_shapekey_name(str(name)):
+            out.add(str(name))
+    return out
+
+
+def expand_facial_merge_candidates(sources: list[dict[str, object]], vertex_limit: int) -> None:
+    """Widen the Face merge so one facial morph never spans multiple bodygroups
+    (issue #131: each side of the split compiles into its own flex slider and
+    the halves move out of sync).
+
+    The per-source pass marks facial_merge_candidate only for sources with
+    facial-NAMED shape keys that stay above the neck base. Custom models break
+    both assumptions: morph names the keyword hints miss, and face materials
+    whose skin extends below the neck (the neck filter then excludes them, e.g.
+    Frostnova's 'face' material carrying 41 facial morphs shared with the eyes
+    and eyelashes).
+
+    Three additional signals, all based on STRONG facial keys (facial-named
+    with a real delta, see strong_facial_shapekeys) and applied greedily while
+    the merged Face stays within ``vertex_limit``:
+    1. shared-key expansion - a source sharing a strong facial key with the
+       current Face set joins it even below the neck, because keeping it
+       separate is exactly what splits that flex slider (transitive);
+    2. dictionary seed - an above-neck source whose strong keys the Step 7
+       flex dictionary knows, even when the keyword hints miss the name;
+    3. bootstrap - when nothing seeded the merge at all, a source with many
+       strong facial keys seeds it even below the neck
+       (face-skin-inside-a-body-material models).
+
+    Non-facial shared morphs (whole-body transformations, breast sliders) are
+    deliberately ignored: merging their sources would fuse half the model into
+    Face on perfectly healthy ports.
+    """
+    vertex_limit = max(1, int(vertex_limit or DEFAULT_SOURCE_VERTEX_LIMIT))
+    candidates = [
+        source
+        for source in sources
+        if source.get("default_enabled", True) and source.get("facial_merge_candidate", False)
+    ]
+    face_total = sum(int(source.get("vertex_count", 0) or 0) for source in candidates)
+    face_keys: set[str] = set()
+    for source in candidates:
+        face_keys.update(strong_facial_shapekeys(source))
+    pending = [
+        source
+        for source in sources
+        if source.get("default_enabled", True)
+        and not source.get("facial_merge_candidate", False)
+        and source.get("shapekey_names")
+    ]
+
+    def neck_exclusion_ok(source: dict[str, object]) -> bool:
+        return source.get("facial_merge_neck_filter_passed", True) is not False
+
+    while pending:
+        ranked: list[tuple[tuple, dict[str, object], list[str], list[str]]] = []
+        for source in pending:
+            strong = strong_facial_shapekeys(source)
+            shared = sorted(strong & face_keys, key=natural_key)
+            dictionary_named = sorted(
+                (name for name in strong if is_dictionary_flex_shapekey(name)), key=natural_key
+            )
+            neck_ok = neck_exclusion_ok(source)
+            shared_needed = 1 if neck_ok else FACIAL_MERGE_NECK_OVERRIDE_MIN_SHARED
+            eligible = len(shared) >= shared_needed or (neck_ok and dictionary_named) or (
+                not candidates and len(strong) >= FACIAL_BOOTSTRAP_MIN_KEYS
+            )
+            if not eligible:
+                continue
+            rank = (
+                0 if neck_ok else 1,
+                0 if shared else 1,
+                -len(shared),
+                -len(strong),
+                int(source.get("vertex_count", 0) or 0),
+                natural_key(str(source.get("uid") or "")),
+            )
+            ranked.append((rank, source, shared, dictionary_named))
+        if not ranked:
+            break
+        ranked.sort(key=lambda item: item[0])
+        _rank, source, shared, dictionary_named = ranked[0]
+        pending.remove(source)
+        vertex_count = int(source.get("vertex_count", 0) or 0)
+        reasons = source.setdefault("facial_merge_reasons", [])
+        warnings = source.setdefault("warnings", [])
+        if candidates and face_total + vertex_count > vertex_limit:
+            reasons.append("skipped by the Face merge vertex-limit cap")
+            warnings.append(
+                f"Left out of the Face merge to keep it within the {vertex_limit:,} vertex limit"
+                + (
+                    f"; shared facial shape keys ({', '.join(shared[:6])}) will compile as separate flex sliders."
+                    if shared
+                    else "."
+                )
+            )
+            continue
+        if shared:
+            reasons.append(
+                f"merged into Face because it shares {len(shared)} facial shape key(s) with the Face merge "
+                f"(e.g. {', '.join(shared[:6])}); keeping it separate would split those flex sliders"
+            )
+        elif dictionary_named:
+            reasons.append(
+                "merged into Face because its shape keys are facial morphs known to the flex dictionary "
+                f"(e.g. {', '.join(dictionary_named[:6])})"
+            )
+        else:
+            reasons.append("seeded the Face merge as the clearest facial morph source")
+        if not neck_exclusion_ok(source):
+            reasons.append(
+                "the below-neck exclusion was overridden by shared facial shape keys"
+                if shared
+                else "the below-neck exclusion was overridden as the clearest facial morph source"
+            )
+            # Drop the stale exclusion warning added by the per-source pass.
+            source["warnings"] = [
+                warning
+                for warning in warnings
+                if "Not merged into Face because at least one vertex is below" not in str(warning)
+            ]
+        source["facial_merge_candidate"] = True
+        source["facial_merge_expanded"] = True
+        candidates.append(source)
+        face_total += vertex_count
+        face_keys.update(strong_facial_shapekeys(source))
+
+    # Surface the near-misses: a source still sharing facial keys with the
+    # merged Face keeps those sliders split, so say so in the plan table.
+    for source in pending:
+        shared = sorted(strong_facial_shapekeys(source) & face_keys, key=natural_key)
+        if shared:
+            source.setdefault("warnings", []).append(
+                f"Shares {len(shared)} facial shape key(s) with the Face merge (e.g. {', '.join(shared[:4])}) "
+                "but was kept separate; those flex sliders will compile once per bodygroup."
+            )
 
 
 def collect_bodygroup_preview(sources: list[dict[str, object]], max_triangles: int = 500000) -> dict[str, object]:
@@ -1487,7 +1741,11 @@ def build_facial_merge_report(
             "reasons": list(source.get("facial_merge_reasons", [])),
         }
         for source in sources
-        if source.get("default_enabled", True) and source.get("facial_merge_neck_filter_passed") is False
+        if source.get("default_enabled", True)
+        and source.get("facial_merge_neck_filter_passed") is False
+        # A source re-included by the shared-shape-key expansion (issue #131) is
+        # merged despite the neck filter, so it is no longer "excluded".
+        and not source.get("facial_merge_candidate", False)
     ]
     merged_group = next(
         (
