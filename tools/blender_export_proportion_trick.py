@@ -192,25 +192,25 @@ def find_named_mesh(name: str) -> bpy.types.Object | None:
 
 
 # Coincident flex-vertex separation. MMD morphs routinely duplicate vertices at
-# the exact same position. In Blender the flexes work, but studiomdl WELDS
-# coincident vertices (within its tolerance) when compiling, collapsing the
-# duplicates' distinct flex deltas and breaking the morph in Garry's Mod. We
-# nudge each extra duplicate apart far enough to survive studiomdl's weld and
-# float32, yet well below visible scale.
+# (or near) the same position. In Blender the flexes work, but studiomdl WELDS
+# vertices within its position tolerance when compiling; welded duplicates with
+# DIFFERENT flex deltas collapse into one vertex that receives both motions,
+# breaking the morph in game (classic symptom: the mouth tears or will not
+# open). Duplicates whose deltas are IDENTICAL - the overwhelming majority,
+# from normal/UV splits - weld harmlessly and must not be touched: nudging
+# them is what opens visible slits.
 #
-# The offset must be SCALE-AWARE: Step 9 runs at Source scale (~64-unit
-# character), where the previous fixed 7.5e-6 nudge was ~1 float32 ULP and far
-# under studiomdl's weld tolerance, so the duplicates merged straight back (the
-# bug). The detection grid stays tight because uniform scaling preserves exact
-# coincidence, so true duplicates always share a bucket.
-COINCIDENT_DETECT_THRESHOLD = 1.0e-6      # detection grid (exact duplicates share a bucket)
-# Separation nudge. Reduced to 10% of the original calibration (1.5e-4 / 5.0e-4):
-# the larger nudge separated the duplicates but left a visible slit on the model
-# in game. At ~10% it is still ~150x a float32 ULP at this scale and within the
-# community 0.001-0.01 Source-unit range, so flexes stay split without a seam.
-# Reduced the threshold so the nudge does not appear in game.
-COINCIDENT_OFFSET_FRACTION = 1.0e-5       # separation as a fraction of the model's largest extent
-COINCIDENT_MIN_OFFSET = 4.0e-5            # absolute floor in Source units
+# Calibration from the Linlong case study: duplicates nudged 1.5e-4 apart
+# still welded back in game (the failed fix), while the community-established
+# safe separation is 0.001-0.01 Source units. All constants are absolute
+# Source units because studiomdl's tolerance is absolute at this stage's
+# ~40x export scale.
+COINCIDENT_WELD_GUARD_RADIUS = 2.0e-3     # different-motion verts closer than this get separated
+COINCIDENT_SEPARATION_DISTANCE = 3.0e-3   # guaranteed spacing after separation (~0.08 mm real scale)
+# Flex deltas are compared on this grid to decide whether coincident vertices
+# move identically; deltas that agree within 1e-4 units are visually the same
+# motion, so welding them costs nothing.
+MOTION_SIGNATURE_EPSILON = 1.0e-4
 
 def model_extent_reference() -> float:
     """Largest world-space bounding-box dimension across the export meshes.
@@ -232,7 +232,32 @@ def model_extent_reference() -> float:
     return max((hi[axis] - lo[axis]) for axis in range(3)) or 1.0
 
 
-def fix_face_basis_stacking(threshold: float = COINCIDENT_DETECT_THRESHOLD) -> dict[str, object]:
+def fix_face_basis_stacking(guard_radius: float = COINCIDENT_WELD_GUARD_RADIUS) -> dict[str, object]:
+    """Separate coincident flex vertices whose morph deltas DIFFER.
+
+    Older revisions nudged EVERY duplicate found on an exact-match 1e-6 grid
+    by a scale-derived offset. The Linlong case study showed both halves fail:
+    near-coincident pairs escaped the exact grid (and its bucket boundaries),
+    and the ~1.5e-4 nudge stayed inside studiomdl's weld tolerance, so the
+    upper/lower mouth duplicates merged straight back in game while every
+    harmless normal/UV-split duplicate got moved for nothing.
+
+    This pass:
+    1. clusters vertices with a KDTree radius search (catches near-coincident
+       pairs, no grid-boundary misses),
+    2. groups each cluster by flex-motion signature and leaves same-motion
+       duplicates untouched (welding them is invisible; moving them is what
+       risks opening seams),
+    3. moves each additional motion group as a whole along its own dominant
+       morph direction until every group centroid pair is at least
+       COINCIDENT_SEPARATION_DISTANCE apart - the smallest displacement that
+       survives the weld, hidden inside the crease the morph itself creates
+       (lip line, eyelid edge).
+    """
+    import numpy as np
+    from collections import defaultdict
+    from mathutils import kdtree
+
     # Every shapekeyed export mesh is checked, not just "Face": any bodygroup
     # carrying flex morphs can hold coincident duplicates.
     meshes = [
@@ -241,69 +266,216 @@ def fix_face_basis_stacking(threshold: float = COINCIDENT_DETECT_THRESHOLD) -> d
         if obj.data.shape_keys is not None and len(obj.data.shape_keys.key_blocks) > 1
     ]
     scale_ref = model_extent_reference()
-    offset = max(COINCIDENT_MIN_OFFSET, scale_ref * COINCIDENT_OFFSET_FRACTION)
     if not meshes:
         return {
             "meshes": [],
             "scale_reference": round(scale_ref, 4),
-            "offset": round(offset, 8),
+            "threshold": guard_radius,
+            "offset": COINCIDENT_SEPARATION_DISTANCE,
             "moved_vertex_count": 0,
             "duplicate_cluster_count": 0,
+            "harmless_cluster_count": 0,
             "warnings": ["No shapekeyed meshes found."],
         }
 
+    separation = COINCIDENT_SEPARATION_DISTANCE
+    golden_angle = 2.399963229728653
     total_moved = 0
     total_clusters = 0
+    total_harmless = 0
+    total_groups_moved = 0
     max_movement = 0.0
+    warnings: list[str] = []
     object_reports: list[dict[str, object]] = []
     for face in meshes:
         mesh = face.data
         key_blocks = list(mesh.shape_keys.key_blocks)
         basis = mesh.shape_keys.key_blocks.get("Basis") or key_blocks[0]
+        vertex_count = len(mesh.vertices)
+        if vertex_count == 0:
+            continue
 
-        buckets: dict[tuple[int, int, int], list[int]] = {}
-        for vertex in mesh.vertices:
-            co = basis.data[vertex.index].co
-            key = (round(co.x / threshold), round(co.y / threshold), round(co.z / threshold))
-            buckets.setdefault(key, []).append(vertex.index)
+        basis_co = np.empty(vertex_count * 3, dtype=np.float64)
+        basis.data.foreach_get("co", basis_co)
+        basis_co = basis_co.reshape(-1, 3)
+
+        # Per-flex delta stack (K x N x 3) and its quantized motion signature.
+        # Offsets are applied to every shape key alike, so deltas - and the
+        # signatures - stay valid across separation rounds.
+        delta_rows: list[np.ndarray] = []
+        for key_block in key_blocks:
+            if key_block is basis:
+                continue
+            key_co = np.empty(vertex_count * 3, dtype=np.float64)
+            key_block.data.foreach_get("co", key_co)
+            delta = key_co.reshape(-1, 3) - basis_co
+            if float(np.abs(delta).max()) <= 1.0e-6:
+                continue  # dead key: no motion anywhere
+            delta_rows.append(delta)
+        delta_stack = np.stack(delta_rows) if delta_rows else np.zeros((0, vertex_count, 3), dtype=np.float64)
+        signature = np.round(delta_stack / MOTION_SIGNATURE_EPSILON).astype(np.int64)
+        signature_bytes = [signature[:, index, :].tobytes() for index in range(vertex_count)]
 
         moved = 0
-        clusters = 0
-        for indices in buckets.values():
-            if len(indices) < 2:
-                continue
-            indices = sorted(indices)
-            clusters += 1
-            for order, vertex_index in enumerate(indices[1:], start=1):
-                angle = order * 2.399963229728653
-                radius = offset * (1.0 + 0.35 * (order % 5))
-                delta = Vector((math.cos(angle) * radius, math.sin(angle) * radius, offset * 0.25 * ((order % 3) - 1)))
-                # Apply to every shape key so the duplicate stays separated in the
-                # basis AND in all flex frames (keeping the VTA deltas distinct).
-                for key_block in key_blocks:
-                    key_block.data[vertex_index].co += delta
-                moved += 1
-                max_movement = max(max_movement, float(delta.length))
+        separated_clusters = 0
+        harmless_clusters = 0
+        groups_moved = 0
+        # Dense duplicate regions (mouth centerline) can relocate a separated
+        # group into ANOTHER cluster's weld range, so verify and repeat: each
+        # round re-detects mixed clusters against current positions and places
+        # groups only where no different-motion vertex sits within the
+        # separation distance. Round 2+ normally finds nothing.
+        for round_index in range(5):
+            tree = kdtree.KDTree(vertex_count)
+            for index in range(vertex_count):
+                tree.insert(Vector(basis_co[index]), index)
+            tree.balance()
+
+            parent = list(range(vertex_count))
+
+            def find(index: int) -> int:
+                while parent[index] != index:
+                    parent[index] = parent[parent[index]]
+                    index = parent[index]
+                return index
+
+            for index in range(vertex_count):
+                for _co, neighbor, _dist in tree.find_range(Vector(basis_co[index]), guard_radius):
+                    if neighbor != index:
+                        ra, rb = find(index), find(int(neighbor))
+                        if ra != rb:
+                            parent[rb] = ra
+
+            clusters: dict[int, list[int]] = defaultdict(list)
+            for index in range(vertex_count):
+                clusters[find(index)].append(index)
+
+            moved_rows_this_round: list[int] = []
+            round_moved = 0
+            for members in clusters.values():
+                if len(members) < 2:
+                    continue
+                groups: dict[bytes, list[int]] = defaultdict(list)
+                for index in members:
+                    groups[signature_bytes[index]].append(index)
+                if len(groups) < 2:
+                    if round_index == 0:
+                        harmless_clusters += 1
+                    continue
+                separated_clusters += 1 if round_index == 0 else 0
+
+                # Anchor = the group with the smallest peak motion (usually the
+                # static side of a lip/eyelid seam); it does not move at all.
+                group_list: list[tuple[float, list[int], np.ndarray]] = []
+                for indices in groups.values():
+                    indices = sorted(indices)
+                    if len(delta_rows):
+                        magnitudes = np.linalg.norm(delta_stack[:, indices[0], :], axis=1)
+                        peak_key = int(magnitudes.argmax())
+                        peak_magnitude = float(magnitudes[peak_key])
+                        peak_direction = delta_stack[peak_key, indices[0], :].copy()
+                    else:
+                        peak_magnitude, peak_direction = 0.0, np.zeros(3)
+                    group_list.append((peak_magnitude, indices, peak_direction))
+                group_list.sort(key=lambda item: (item[0], item[1][0]))
+
+                def trial_clear(final_centroid: np.ndarray, group_rows: set[int], group_sig: bytes) -> bool:
+                    """No different-motion vertex within the separation distance
+                    of the trial position (checks the round-start tree plus any
+                    vertices already moved this round at their new spots)."""
+                    for _co, neighbor, _dist in tree.find_range(Vector(final_centroid), separation * 0.999):
+                        neighbor = int(neighbor)
+                        if neighbor not in group_rows and signature_bytes[neighbor] != group_sig:
+                            return False
+                    for row in moved_rows_this_round:
+                        if row in group_rows or signature_bytes[row] == group_sig:
+                            continue
+                        if float(np.linalg.norm(basis_co[row] - final_centroid)) < separation * 0.999:
+                            return False
+                    return True
+
+                for order, (peak_magnitude, indices, peak_direction) in enumerate(group_list[1:], start=1):
+                    group_rows = set(indices)
+                    group_sig = signature_bytes[indices[0]]
+                    centroid = basis_co[indices].mean(axis=0)
+                    norm = float(np.linalg.norm(peak_direction))
+                    candidates: list[np.ndarray] = []
+                    if norm > 1.0e-9:
+                        candidates.append(peak_direction / norm)
+                    for extra in range(8):
+                        angle = (order + extra) * golden_angle
+                        fallback = np.array(
+                            [math.cos(angle), math.sin(angle), 0.35 * (((order + extra) % 3) - 1)], dtype=np.float64
+                        )
+                        candidates.append(fallback / np.linalg.norm(fallback))
+                    offset_vec = None
+                    for direction in candidates:
+                        for scale_step in (1.0, 1.4, 2.0):
+                            trial = direction * separation * scale_step
+                            if trial_clear(centroid + trial, group_rows, group_sig):
+                                offset_vec = trial
+                                break
+                        if offset_vec is not None:
+                            break
+                    if offset_vec is None:
+                        offset_vec = candidates[0] * separation
+                        warnings.append(
+                            f"{face.name}: could not guarantee {separation:.4f} spacing for a duplicate group at "
+                            f"{np.round(centroid, 4).tolist()}; applied best-effort separation."
+                        )
+                    move = Vector((float(offset_vec[0]), float(offset_vec[1]), float(offset_vec[2])))
+                    # Apply to every shape key so the group stays separated in
+                    # the basis AND in all flex frames (VTA deltas intact).
+                    for index in indices:
+                        for key_block in key_blocks:
+                            key_block.data[index].co += move
+                        basis_co[index] += offset_vec
+                        moved_rows_this_round.append(index)
+                    round_moved += len(indices)
+                    groups_moved += 1
+                    max_movement = max(max_movement, float(np.linalg.norm(offset_vec)))
+            moved += round_moved
+            if round_moved == 0:
+                if round_index > 0:
+                    log(f"Coincident flex-vertex separation converged after {round_index + 1} round(s) on {face.name}.")
+                break
+        else:
+            warnings.append(f"{face.name}: coincident-vertex separation did not fully converge after 5 rounds.")
         if moved:
             mesh.update()
         total_moved += moved
-        total_clusters += clusters
-        object_reports.append({"object": face.name, "moved_vertex_count": moved, "duplicate_cluster_count": clusters})
+        total_clusters += separated_clusters
+        total_harmless += harmless_clusters
+        total_groups_moved += groups_moved
+        object_reports.append(
+            {
+                "object": face.name,
+                "moved_vertex_count": moved,
+                "duplicate_cluster_count": separated_clusters,
+                "harmless_cluster_count": harmless_clusters,
+                "moved_group_count": groups_moved,
+            }
+        )
 
     log(
-        f"Coincident flex-vertex check moved {total_moved} duplicate vertex/vertices across {total_clusters} "
-        f"cluster(s) in {len(meshes)} shapekeyed mesh(es); offset={offset:.6f} (model extent {scale_ref:.2f})."
+        f"Coincident flex-vertex check separated {total_moved} vertex/vertices in {total_clusters} "
+        f"different-motion cluster(s) across {len(meshes)} shapekeyed mesh(es); "
+        f"left {total_harmless} same-motion duplicate cluster(s) untouched; "
+        f"separation={separation:.4f} guard={guard_radius:.4f}."
     )
     return {
         "meshes": [obj.name for obj in meshes],
         "face_object": next((obj.name for obj in meshes if obj.name == "Face"), meshes[0].name),
         "scale_reference": round(scale_ref, 4),
-        "threshold": threshold,
-        "offset": round(offset, 8),
+        "threshold": guard_radius,
+        "offset": separation,
         "moved_vertex_count": total_moved,
         "duplicate_cluster_count": total_clusters,
+        "harmless_cluster_count": total_harmless,
+        "moved_group_count": total_groups_moved,
         "max_movement": round(max_movement, 8),
         "objects": object_reports,
+        "warnings": warnings,
     }
 
 
