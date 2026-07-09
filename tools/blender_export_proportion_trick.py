@@ -209,8 +209,8 @@ COINCIDENT_DETECT_THRESHOLD = 1.0e-6      # detection grid (exact duplicates sha
 # in game. At ~10% it is still ~150x a float32 ULP at this scale and within the
 # community 0.001-0.01 Source-unit range, so flexes stay split without a seam.
 # Reduced the threshold so the nudge does not appear in game.
-COINCIDENT_OFFSET_FRACTION = 2.4e-6       # separation as a fraction of the model's largest extent
-COINCIDENT_MIN_OFFSET = 8.0e-6            # absolute floor in Source units
+COINCIDENT_OFFSET_FRACTION = 1.0e-5       # separation as a fraction of the model's largest extent
+COINCIDENT_MIN_OFFSET = 4.0e-5            # absolute floor in Source units
 
 def model_extent_reference() -> float:
     """Largest world-space bounding-box dimension across the export meshes.
