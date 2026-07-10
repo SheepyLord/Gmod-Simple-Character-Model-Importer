@@ -116,7 +116,169 @@ PBR_SCHEMES: dict[str, dict[str, Any]] = {
             "ao": ("mask", "g", False),
         },
     },
+    "moongaze_pbr": {
+        "label": "MoonGaze-like PBR (packed _M / _OD maps)",
+        "base_suffixes": ("_d", "_od"),
+        # MoonGaze/HoyoToon exports keep the PBR maps in a SEPARATE sibling folder
+        # (e.g. "extra texture") with a model-code prefix and names unrelated to the
+        # PMX color texture, so the exact stem-root matcher used by the schemes above
+        # cannot find them. Use fuzzy cross-folder matching keyed off the material
+        # name and base-color filename instead (see fuzzy_pbr_siblings).
+        "resolver": "fuzzy",
+        # role -> the trailing filename token that identifies each map.
+        "fuzzy_roles": {
+            "mask": ("m", "mask"),
+            "normal": ("n", "nrm", "norm", "normal"),
+            "emission": ("e", "emissive", "emission", "glow"),
+        },
+        # Packed spec/material mask (_M): red = specular/phong intensity -> gloss
+        # (bright = shiny = sharper highlight). No metallic/AO because the toon _M
+        # channel packing varies per model and guessing wrong looks worse than
+        # leaving it to the phong shader; a real _N normal (fuzzy) and _E emission
+        # are picked up through the normal pipeline and the emission slot.
+        "packed_channels": {
+            "roughness": ("mask", "r", True),
+        },
+    },
 }
+
+# Fuzzy PBR matching (MoonGaze scheme): a candidate map is accepted when its
+# similarity to the material name or base-color filename reaches this ratio.
+# Calibrated on the Lailai model so clear matches (body1_M, UAV1_M, hair_N) land
+# while unrelated masks (beibao_M for a "Package" material) are left out.
+FUZZY_PBR_MATCH_THRESHOLD = 0.62
+# Filename tokens that never carry material identity (toon-shader variant/junk
+# tokens); they lower a candidate's priority but do not disqualify it.
+FUZZY_PBR_SECONDARY_TOKENS = frozenset(
+    {"leishe", "specular", "reflection", "sdf", "complexio", "zz", "ramp", "outlinemask", "od", "original"}
+)
+
+
+def _fuzzy_segments(stem: str) -> list[str]:
+    return [s for s in re.split(r"[_\s]+", str(stem or "").strip()) if s]
+
+
+def _fuzzy_trailing_role(stem: str, fuzzy_roles: dict[str, tuple[str, ...]]) -> str | None:
+    segs = _fuzzy_segments(stem)
+    if not segs:
+        return None
+    last = re.sub(r"[^a-z0-9]+", "", segs[-1].lower())
+    for role, tokens in fuzzy_roles.items():
+        if last in tokens:
+            return role
+    return None
+
+
+def _fuzzy_model_prefix(files: list[Path], fuzzy_roles: dict[str, tuple[str, ...]]) -> str:
+    """Dominant leading underscore-segment across the role-tagged files, so a
+    shared model code ('LailaiR21M11') does not pollute name matching."""
+    from collections import Counter
+
+    leads: Counter[str] = Counter()
+    tagged = [path for path in files if _fuzzy_trailing_role(path.stem, fuzzy_roles)]
+    for path in tagged:
+        segs = _fuzzy_segments(path.stem)
+        if len(segs) >= 2:
+            leads[segs[0].lower()] += 1
+    if not leads:
+        return ""
+    token, count = leads.most_common(1)[0]
+    return token if count >= max(2, int(0.5 * len(tagged))) else ""
+
+
+def _fuzzy_content_segments(stem: str, model_prefix: str, fuzzy_roles: dict[str, tuple[str, ...]]) -> list[str]:
+    segs = _fuzzy_segments(stem)
+    if segs and model_prefix and segs[0].lower() == model_prefix:
+        segs = segs[1:]
+    if segs and _fuzzy_trailing_role(stem, fuzzy_roles):
+        segs = segs[:-1]
+    return [re.sub(r"[^a-z0-9-￿]+", "", s.lower()) for s in segs if s.strip()]
+
+
+def _fuzzy_trailing_digits(value: str) -> str:
+    match = re.search(r"(\d+)$", value)
+    return match.group(1) if match else ""
+
+
+def _fuzzy_token_score(target: str, token: str) -> float:
+    from difflib import SequenceMatcher
+
+    if not target or not token:
+        return 0.0
+    if target == token:
+        return 1.0
+    score = SequenceMatcher(None, target, token).ratio()
+    if len(target) >= 3 and len(token) >= 3 and (target in token or token in target):
+        score = max(score, 0.86)
+    # Digit-variant guard: "body1" and "body2" are different materials even though
+    # they are ~0.8 similar; a differing trailing number means a different material.
+    td, kd = _fuzzy_trailing_digits(target), _fuzzy_trailing_digits(token)
+    if td and kd and td != kd:
+        score = min(score, 0.45)
+    return score
+
+
+def _fuzzy_match_score(material_name: str, base_stem: str, cand_content: list[str]) -> float:
+    targets = [
+        re.sub(r"[^a-z0-9-￿]+", "", str(material_name or "").lower()),
+        re.sub(r"[^a-z0-9-￿]+", "", str(base_stem or "").lower()),
+    ]
+    identity = [tok for tok in cand_content if tok not in FUZZY_PBR_SECONDARY_TOKENS] or cand_content
+    best = 0.0
+    joined = "".join(identity)
+    for target in targets:
+        if not target:
+            continue
+        for token in identity:
+            best = max(best, _fuzzy_token_score(target, token))
+        best = max(best, _fuzzy_token_score(target, joined))
+    return best
+
+
+def fuzzy_pbr_siblings(
+    spec: dict[str, Any],
+    base_path: Path | None,
+    workspace_root: Path,
+    material_name: str,
+    base_color_file: str,
+) -> dict[str, Path]:
+    """Fuzzy cross-folder PBR map resolution for the MoonGaze scheme.
+
+    Reuses the recursive source-asset walk (so maps in a sibling 'extra texture'
+    folder are reachable) but matches each role's trailing-suffix files
+    (``*_M`` / ``*_N`` / ``*_E``) to the material by name similarity rather than
+    an exact shared stem root.
+    """
+    fuzzy_roles = {str(role): tuple(tokens) for role, tokens in spec.get("fuzzy_roles", {}).items()}
+    if not fuzzy_roles:
+        return {}
+    search_dirs = collect_search_dirs(base_path, workspace_root) if base_path else []
+    search_dirs = search_dirs + source_texture_search_dirs(base_path, workspace_root)
+    files = collect_image_files(search_dirs)
+    if not files:
+        return {}
+    model_prefix = _fuzzy_model_prefix(files, fuzzy_roles)
+    base_stem = base_path.stem if base_path else Path(str(base_color_file or "")).stem
+    base_resolved = base_path.resolve() if base_path else None
+
+    out: dict[str, Path] = {}
+    for role in fuzzy_roles:
+        scored: list[tuple[float, int, Path]] = []
+        for path in files:
+            if _fuzzy_trailing_role(path.stem, fuzzy_roles) != role:
+                continue
+            if base_resolved is not None and path.resolve() == base_resolved:
+                continue
+            content = _fuzzy_content_segments(path.stem, model_prefix, fuzzy_roles)
+            if not content:
+                continue
+            score = _fuzzy_match_score(material_name, base_stem, content)
+            extra = len(content) - 1 + sum(1 for tok in content if tok in FUZZY_PBR_SECONDARY_TOKENS)
+            scored.append((score, -extra, path))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        if scored and scored[0][0] >= FUZZY_PBR_MATCH_THRESHOLD:
+            out[role] = scored[0][2]
+    return out
 
 
 def normalize_scheme(value: str | None) -> str:
@@ -182,7 +344,13 @@ def find_sibling_texture(
     return None
 
 
-def detect_pbr_maps(base_path: Path | None, workspace_root: Path, scheme: str) -> dict[str, Any]:
+def detect_pbr_maps(
+    base_path: Path | None,
+    workspace_root: Path,
+    scheme: str,
+    material_name: str = "",
+    base_color_file: str = "",
+) -> dict[str, Any]:
     """Detect scheme-specific PBR sibling/packed maps for one material.
 
     Returns ``{}`` for the legacy scheme or when no base texture exists, so the
@@ -194,11 +362,16 @@ def detect_pbr_maps(base_path: Path | None, workspace_root: Path, scheme: str) -
     if not spec or base_path is None:
         return {}
     base_suffixes = tuple(spec.get("base_suffixes", ("_d",)))
-    sibling_paths: dict[str, Path] = {}
-    for role, suffixes in spec.get("sibling_suffixes", {}).items():
-        found = find_sibling_texture(base_path, base_suffixes, tuple(suffixes), workspace_root)
-        if found is not None:
-            sibling_paths[role] = found
+    if str(spec.get("resolver") or "exact") == "fuzzy":
+        # MoonGaze: maps live in a separate folder with unrelated names, matched
+        # by fuzzy name similarity to the material rather than a shared stem root.
+        sibling_paths = fuzzy_pbr_siblings(spec, base_path, workspace_root, material_name, base_color_file)
+    else:
+        sibling_paths = {}
+        for role, suffixes in spec.get("sibling_suffixes", {}).items():
+            found = find_sibling_texture(base_path, base_suffixes, tuple(suffixes), workspace_root)
+            if found is not None:
+                sibling_paths[role] = found
 
     maps: dict[str, dict[str, Any]] = {}
     if "normal" in sibling_paths:
@@ -932,6 +1105,27 @@ def save_normal_png(input_path: Path, output_path: Path) -> tuple[tuple[int, int
     return original_size, image.size, resized
 
 
+# Neutral placeholder for a genuinely missing/unreadable base texture. Flat mid
+# grey (opaque) so the material renders as a plain surface instead of the in-game
+# missing-texture checkerboard, keeping the model usable while the report flags
+# the material for the user to fix. Kept small since it carries no real detail.
+PLACEHOLDER_BASE_EDGE = 64
+PLACEHOLDER_BASE_RGBA = (128, 128, 128, 255)
+
+
+def write_placeholder_base_png(output_path: Path, size: tuple[int, int] | None = None) -> tuple[int, int]:
+    width = height = PLACEHOLDER_BASE_EDGE
+    if size and size[0] > 0 and size[1] > 0:
+        longest = max(size)
+        cap = min(256, _ACTIVE_MAX_TEXTURE_EDGE)
+        scale = min(1.0, cap / float(longest)) if longest > 0 else 1.0
+        width = max(4, int(round(size[0] * scale)))
+        height = max(4, int(round(size[1] * scale)))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (width, height), PLACEHOLDER_BASE_RGBA).save(output_path)
+    return width, height
+
+
 def analyze_textures(input_path: Path, analysis_json: Path, plan_json: Path, scheme: str = PBR_SCHEME_LEGACY, game: str = "gmod", max_texture_edge: int = 0) -> dict[str, Any]:
     global _ACTIVE_MAX_TEXTURE_EDGE
     _ACTIVE_MAX_TEXTURE_EDGE = resolve_max_texture_edge(game, max_texture_edge)
@@ -1037,9 +1231,39 @@ def analyze_textures(input_path: Path, analysis_json: Path, plan_json: Path, sch
             "warnings": warnings,
         }
         if scheme != PBR_SCHEME_LEGACY:
-            pbr = detect_pbr_maps(base_path if base_exists else None, workspace_root, scheme)
+            pbr = detect_pbr_maps(
+                base_path if base_exists else None,
+                workspace_root,
+                scheme,
+                material_name=material.material_name,
+                base_color_file=material.base_color_file,
+            )
             if pbr:
                 row["pbr"] = pbr
+                # Fuzzy schemes (MoonGaze) can resolve a normal in a separate
+                # folder that the exact-stem normal finder missed. Back-fill the
+                # row's normal source so the standard normal pipeline (and the
+                # Step-12 normal toggle) can apply it; stays disabled by default.
+                normal_map = pbr.get("maps", {}).get("normal") if isinstance(pbr.get("maps"), dict) else None
+                if (
+                    isinstance(normal_map, dict)
+                    and normal_map.get("available")
+                    and normal_map.get("source")
+                    and not row.get("normal_source_path")
+                ):
+                    kind_to_action = {
+                        "convert_ue_rg": ("ue_rg", "convert_ue_rg"),
+                        "copy_blue": ("blue", "copy_blue"),
+                        "ambiguous_copy": ("ambiguous", "ambiguous_copy"),
+                    }
+                    ntype, naction = kind_to_action.get(str(normal_map.get("kind") or ""), ("ambiguous", "ambiguous_copy"))
+                    row["normal_source_path"] = str(normal_map["source"])
+                    row["normal_type"] = ntype
+                    row["normal_action_default"] = naction
+                    row["warnings"].append(
+                        f"Normal map {Path(str(normal_map['source'])).name} matched from a separate folder "
+                        "(disabled by default; enable the normal to bake it)."
+                    )
                 detected = sorted(role for role, info in pbr.get("maps", {}).items() if info.get("available"))
                 if detected:
                     emit(f"[Step12 Textures]   PBR maps detected for {material.output_name}: {', '.join(detected)} (disabled by default).")
@@ -1106,6 +1330,7 @@ def process_textures(input_path: Path, plan_json: Path, report_json: Path, manif
     normal_dir.mkdir(parents=True, exist_ok=True)
     manifest_rows: list[dict[str, Any]] = []
     errors: list[str] = []
+    placeholder_materials: list[str] = []
     started = time.monotonic()
     emit(f"[Step12 Textures] Processing {len(rows)} texture rows.")
     for index, row in enumerate(rows, start=1):
@@ -1165,10 +1390,33 @@ def process_textures(input_path: Path, plan_json: Path, report_json: Path, manif
                     except Exception as ao_exc:
                         row_report["warnings"].append(f"AO bake failed: {ao_exc}")
         except Exception as exc:
-            errors.append(str(exc))
-            row_report["error"] = str(exc)
+            # A missing or unreadable base texture must NOT abort the whole step:
+            # the model's other materials are fine, and one broken material would
+            # otherwise fail the entire import. Write a neutral placeholder so the
+            # material still compiles to a plain surface (not the in-game missing-
+            # texture checkerboard) and record a prominent warning instead of a
+            # blocking error. Only a failure to even write the placeholder is fatal.
+            try:
+                placeholder_size = write_placeholder_base_png(
+                    base_output, tuple(row.get("base_size") or ()) or None
+                )
+                row_report["base_output_size"] = list(placeholder_size)
+                row_report["base_is_placeholder"] = True
+                row_report["base_placeholder_reason"] = str(exc)
+                row_report["warnings"].append(
+                    f"Base texture missing or unreadable ({exc}); wrote a neutral placeholder. "
+                    "Supply the correct texture (or point the material at an existing one) and re-run Step 12."
+                )
+                placeholder_materials.append(material_name)
+                emit(f"[Step12 Textures] [{index}/{len(rows)}] {material_name}: WARNING placeholder base ({exc}).")
+            except Exception as placeholder_exc:
+                errors.append(f"{material_name}: {exc}; placeholder also failed: {placeholder_exc}")
+                row_report["error"] = str(exc)
+                manifest_rows.append(row_report)
+                emit(f"[Step12 Textures] [{index}/{len(rows)}] {material_name}: ERROR {exc}")
+                continue
+            # A placeholder base carries no detail, so skip normal/PBR derivation.
             manifest_rows.append(row_report)
-            emit(f"[Step12 Textures] [{index}/{len(rows)}] {material_name}: ERROR {exc}")
             continue
 
         normal_action = str(row.get("normal_action") or "disabled")
@@ -1299,6 +1547,11 @@ def process_textures(input_path: Path, plan_json: Path, report_json: Path, manif
         "clamped_textures": clamped_textures,
         "textures": manifest_rows,
     }
+    if placeholder_materials:
+        emit(
+            f"[Step12 Textures] Wrote neutral placeholder base textures for {len(placeholder_materials)} "
+            f"material(s) with a missing source: {', '.join(placeholder_materials)}."
+        )
     report = {
         "version": 1,
         "input": str(input_path.resolve()),
@@ -1306,6 +1559,8 @@ def process_textures(input_path: Path, plan_json: Path, report_json: Path, manif
         "processed_count": len([row for row in manifest_rows if not row.get("error")]),
         "error_count": len(errors),
         "errors": errors,
+        "placeholder_count": len(placeholder_materials),
+        "placeholder_materials": placeholder_materials,
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "manifest_path": str(manifest_json),
     }
@@ -1327,7 +1582,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--plan-json", type=Path, required=True)
     parser.add_argument("--report-json", type=Path)
     parser.add_argument("--manifest-json", type=Path)
-    parser.add_argument("--scheme", default=None, help="PBR texture scheme (legacy, unreal_wuwa, unity_endfield). Process mode falls back to the plan's stored scheme when omitted.")
+    parser.add_argument("--scheme", default=None, help="PBR texture scheme (legacy, unreal_wuwa, unity_endfield, moongaze_pbr). Process mode falls back to the plan's stored scheme when omitted.")
     parser.add_argument("--game", default="gmod", help="Target game; 'l4d2' clamps every texture to 2048px (the game crashes on larger maps). Default 'gmod' keeps the 4096 cap.")
     parser.add_argument("--max-texture-edge", type=int, default=0, help="Longest-edge cap in px (4096/2048/1024). 0 = game default (4096 GMod / 2048 L4D2). Never exceeds the game's hard cap.")
     args = parser.parse_args(argv)

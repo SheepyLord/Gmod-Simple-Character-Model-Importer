@@ -9494,6 +9494,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             ("Legacy — base color only (same as auto-port)", "legacy"),
             ("Unreal — Wuthering Waves-like PBR", "unreal_wuwa"),
             ("Unity — Arknights Endfield-like PBR", "unity_endfield"),
+            ("MoonGaze-like PBR (packed _M / _OD maps)", "moongaze_pbr"),
         ):
             self.texture_scheme_combo.addItem(scheme_label, scheme_data)
         self.texture_scheme_combo.setToolTip(
@@ -9501,6 +9502,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
             "• Legacy: base color only, identical to the one-click auto-port.\n"
             "• Unreal (Wuthering Waves): _D base, _N/_HN normal (roughness packed in _N alpha).\n"
             "• Unity (Arknights Endfield): _D base, _N/_NRO normal, _P mask (R=metallic, G=AO, A=smoothness), _E emission.\n"
+            "• MoonGaze-like: packed _M spec/material mask (R→phong), optional _N normal / _E emission. "
+            "Matches maps by NAME across folders, so PBR maps in a separate 'extra texture' folder are found.\n"
             "Pick a PBR scheme, then Analyze to scan each material for maps; toggle the ones to bake per material.\n"
             "Metallic/roughness are approximated through Source's phong shader; no $envmap is used."
         )
