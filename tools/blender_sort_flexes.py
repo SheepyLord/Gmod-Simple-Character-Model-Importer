@@ -116,10 +116,21 @@ def flex_output_name(name: str) -> str:
 
 
 def normalized_name(name: str) -> str:
+    """Loose match key for a morph name (case/space/punctuation insensitive).
+
+    CJK code points are PRESERVED. Stripping them (the old ``[^a-z0-9]``) made
+    every Japanese-only morph normalize to the empty string, so an untranslated
+    model collapsed all of its expressions onto whichever symbol-only dictionary
+    key ("!", "?", "……", "▲", …) also normalized to "" — every flex came out as
+    the same wrong name with a _NN counter. Keeping the kana/kanji lets Japanese
+    dictionary entries match directly when CATS translation is unavailable.
+    """
     text = str(name or "").lower()
     text = text.replace("左", "left").replace("右", "right")
     text = text.replace("ω", "omega")
-    return re.sub(r"[^a-z0-9]+", "", text)
+    # Keep ASCII alphanumerics plus hiragana, katakana, CJK ideographs and the
+    # CJK/fullwidth digit ranges MMD morph names use.
+    return re.sub(r"[^a-z0-9぀-ゟ゠-ヿ㐀-䶿一-鿿０-９]+", "", text)
 
 
 def unique_name(base: str, used: set[str], fallback: str) -> str:
@@ -223,7 +234,7 @@ def infer_flex_name(original: str, bodygroup: str, mapping: dict[str, str], norm
         name = mapping[original]
         return name, category_for_flex(name, bodygroup), 1.0, warnings
     normalized = normalized_name(original)
-    if normalized in normalized_mapping:
+    if normalized and normalized in normalized_mapping:
         name = normalized_mapping[normalized]
         return name, category_for_flex(name, bodygroup), 0.92, warnings
 
@@ -577,14 +588,21 @@ def resolve_l4d2_controller(original: str, mapping: dict[str, str], normalized_m
     if original in mapping:
         return mapping[original], 1.0
     norm = normalized_name(original)
-    if norm in normalized_mapping:
+    if norm and norm in normalized_mapping:
         return normalized_mapping[norm], 0.92
     return "", 0.0
 
 
 def collect_flexes(game: str = "gmod") -> tuple[list[dict[str, object]], list[str]]:
     mapping, mapping_warnings = load_reference_mapping(game)
-    normalized_mapping = {normalized_name(key): value for key, value in mapping.items()}
+    # Skip keys with an empty normalized form (symbol-only names like "!", "?",
+    # "……", "▲"). They would otherwise all share the "" bucket and match every
+    # morph whose name normalizes to nothing.
+    normalized_mapping = {
+        normalized: value
+        for normalized, value in ((normalized_name(key), value) for key, value in mapping.items())
+        if normalized
+    }
     used_names: set[str] = set()
     used_l4d2_controllers: set[str] = set()
     flexes: list[dict[str, object]] = []
