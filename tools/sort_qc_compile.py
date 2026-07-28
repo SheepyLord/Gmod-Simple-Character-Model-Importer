@@ -2086,11 +2086,25 @@ def bodygroup_block(name: str, smd: str, optional_blank: bool = True) -> list[st
     return bodygroup_group_block(name, [smd], optional_blank)
 
 
+# Core body parts that are never hideable by default: removing them in game
+# leaves the character visibly broken (a floating head, a bald scalp, missing
+# limbs) rather than showing an intentional outfit variation. Their $bodygroup
+# omits `blank`, so the part cannot be switched off. Matched case-insensitively
+# on the exact bodygroup name; the user can still tick "can hide" per part in
+# the Step-14 table to override this.
+ESSENTIAL_BODYGROUP_NAMES = frozenset({"hair", "body", "face", "legs", "arms"})
+
+
+def is_essential_bodygroup(name: str) -> bool:
+    return str(name or "").strip().casefold() in ESSENTIAL_BODYGROUP_NAMES
+
+
 def default_bodygroup_rows(step9_dir: Path) -> list[dict[str, Any]]:
     """Default bodygroup control rows: one per body-part SMD (Physics excluded),
     Face/Body first then the rest alphabetical. Each part is its own group and
     hideable, except flex parts (a sibling .vta) which are locked to their own
-    group and non-hideable (they must stay $model blocks for the flexes)."""
+    group and non-hideable (they must stay $model blocks for the flexes), and
+    the core body parts in ESSENTIAL_BODYGROUP_NAMES."""
     rows: list[dict[str, Any]] = []
     ordered: list[Path] = []
     for special in ("Face.smd", "Body.smd"):
@@ -2110,16 +2124,16 @@ def default_bodygroup_rows(step9_dir: Path) -> list[dict[str, Any]]:
                 "name": name,
                 "has_flex": has_flex,
                 "group": name,
-                "can_hide": not has_flex,
+                "can_hide": not has_flex and not is_essential_bodygroup(name),
             }
         )
     return rows
 
 
 def _bodygroup_qc_blocks_scan(source_dir: Path, include_flexes: bool) -> list[str]:
-    """Back-compat default: every SMD is its own hideable bodygroup; flex SMDs
-    (with a .vta) become $model blocks. Used when the plan has no bodygroup
-    config (auto-port, legacy plans)."""
+    """Back-compat default: every SMD is its own bodygroup, hideable except the
+    core body parts (ESSENTIAL_BODYGROUP_NAMES); flex SMDs (with a .vta) become
+    $model blocks. Used when the plan has no bodygroup config (legacy plans)."""
     lines: list[str] = []
     consumed = {"Physics.smd"}
     if (source_dir / "Face.smd").exists():
@@ -2128,7 +2142,7 @@ def _bodygroup_qc_blocks_scan(source_dir: Path, include_flexes: bool) -> list[st
         lines.extend(
             flex_model_block("Face", "Face.smd", face_vta)
             if include_flexes and face_vta.exists()
-            else bodygroup_block("Face", "Face.smd")
+            else bodygroup_block("Face", "Face.smd", not is_essential_bodygroup("Face"))
         )
     if (source_dir / "Body.smd").exists():
         consumed.add("Body.smd")
@@ -2136,7 +2150,7 @@ def _bodygroup_qc_blocks_scan(source_dir: Path, include_flexes: bool) -> list[st
         lines.extend(
             flex_model_block("Body", "Body.smd", body_vta)
             if include_flexes and body_vta.exists()
-            else bodygroup_block("Body", "Body.smd")
+            else bodygroup_block("Body", "Body.smd", not is_essential_bodygroup("Body"))
         )
     for smd in sorted(source_dir.glob("*.smd"), key=lambda item: natural_key(item.name)):
         if smd.name in consumed:
@@ -2146,7 +2160,7 @@ def _bodygroup_qc_blocks_scan(source_dir: Path, include_flexes: bool) -> list[st
         if include_flexes and vta.exists():
             lines.extend(flex_model_block(name, smd.name, vta))
             continue
-        lines.extend(bodygroup_block(name, smd.name))
+        lines.extend(bodygroup_block(name, smd.name, not is_essential_bodygroup(name)))
     return lines
 
 
@@ -2200,7 +2214,8 @@ def _bodygroup_qc_blocks_from_config(source_dir: Path, include_flexes: bool, bod
             can_hide = all(bool(m["can_hide"]) for m in nonflex)
             lines.extend(bodygroup_group_block(group, studios, can_hide))
     # Any SMD present on disk but absent from the config (e.g. re-exported with a
-    # new part) falls back to its own hideable bodygroup so nothing is dropped.
+    # new part) falls back to its own bodygroup so nothing is dropped, hideable
+    # unless it is a core body part.
     for smd in sorted(source_dir.glob("*.smd"), key=lambda item: natural_key(item.name)):
         if smd.name in covered or smd.name == "Physics.smd":
             continue
@@ -2209,7 +2224,7 @@ def _bodygroup_qc_blocks_from_config(source_dir: Path, include_flexes: bool, bod
         if include_flexes and vta.exists():
             lines.extend(flex_model_block(stem, smd.name, vta))
         else:
-            lines.extend(bodygroup_block(stem, smd.name))
+            lines.extend(bodygroup_block(stem, smd.name, not is_essential_bodygroup(stem)))
     return lines
 
 
