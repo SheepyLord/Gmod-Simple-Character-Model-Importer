@@ -795,16 +795,24 @@ def validation_for_armature(armature: bpy.types.Object, added_bones: set[str] | 
                     f"({drift:.4f} > {max_drift:.4f}); spine assignment is likely wrong."
                 )
 
-    def side_check(right: str, left: str, label: str) -> None:
+    def side_check(right: str, left: str, label: str, *, use_midpoint: bool = False) -> None:
         if right not in bones or left not in bones:
             warnings.append(f"Could not validate {label} left/right side because one landmark is missing.")
             return
-        right_x = float(bones[right].head_local.x)
-        left_x = float(bones[left].head_local.x)
+        right_bone = bones[right]
+        left_bone = bones[left]
+        if use_midpoint:
+            # Clavicles can share a chest-center head, so their segment
+            # midpoints carry the side information without relying on direction.
+            right_x = (float(right_bone.head_local.x) + float(right_bone.tail_local.x)) * 0.5
+            left_x = (float(left_bone.head_local.x) + float(left_bone.tail_local.x)) * 0.5
+        else:
+            right_x = float(right_bone.head_local.x)
+            left_x = float(left_bone.head_local.x)
         if not (right_x < left_x):
             errors.append(f"{label} side appears swapped: expected {right} on negative X and {left} on positive X.")
 
-    side_check(R_CLAVICLE, L_CLAVICLE, "clavicle")
+    side_check(R_CLAVICLE, L_CLAVICLE, "clavicle", use_midpoint=True)
     side_check(R_THIGH, L_THIGH, "leg")
     for target in added_bones:
         warnings.append(f"{target} was added as an unweighted deform bone.")
