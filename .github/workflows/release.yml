@@ -1,0 +1,104 @@
+name: Release Windows executables
+
+# Builds BOTH shipping variants and attaches them to a GitHub Release.
+#
+# Triggered by pushing a release tag (the repo's convention is Release1,
+# Release2, ... Release17) or from the Actions tab against an existing tag.
+# The release is created as a DRAFT so nothing is announced until you review
+# the assets and press Publish.
+
+on:
+  push:
+    tags:
+      - "Release*"
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach assets to"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and attach release assets
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: echo "name=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.name }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      # The with-Blender build bundles this zip; the script verifies its SHA256
+      # against build_assets_manifest.json before use.
+      - name: Download and verify the Blender build asset
+        shell: powershell
+        run: ./scripts/download_build_assets.ps1
+
+      # Built first, while the Blender zip is present at the repo root.
+      - name: Build with-Blender executable
+        shell: powershell
+        run: ./tools/build_mmd_character_importer_exe.ps1 -Python python
+
+      - name: Build without-Blender executable
+        shell: powershell
+        run: ./tools/build_mmd_character_importer_exe_no_blender.ps1 -Python python
+
+      - name: Summarize release payload
+        shell: powershell
+        run: |
+          Get-ChildItem release -Recurse -File |
+            Select-Object @{n = "File"; e = { $_.Name } },
+                          @{n = "MB"; e = { [math]::Round($_.Length / 1MB, 2) } } |
+            Sort-Object MB -Descending | Format-Table -AutoSize | Out-String -Width 200
+
+      # gh is preinstalled on GitHub runners, so no third-party action is needed.
+      - name: Create draft release if it does not exist
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; assets will be added to it."
+          else
+            gh release create "$TAG" --draft --title "$TAG" --generate-notes
+          fi
+
+      - name: Upload release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: gh release upload "$TAG" release/*.exe release/*.txt release/*.json --clobber
+
+      - name: Upload build artifact (backup copy)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.tag.outputs.name }}
+          path: release/
+          retention-days: 7
+          if-no-files-found: error
