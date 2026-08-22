@@ -4614,6 +4614,7 @@ def run_proportion_export(
     cancel_check: CancelCheck | None = None,
     game: str = "gmod",
     survivor: str = DEFAULT_L4D2_SURVIVOR,
+    natural_bone_orientation: bool = False,
 ) -> ProportionResult:
     input_blend = input_blend.resolve()
     if not input_blend.exists():
@@ -4666,6 +4667,11 @@ def run_proportion_export(
     ]
     if remove_zero_weight_bones:
         command.append("--remove-zero-weight-bones")
+    # SFM static-bones mode (issue #141): keep authored bone orientations so the
+    # MDL bind pose SFM falls back to is the natural one. Only appended when
+    # requested, so every other run stays byte-identical.
+    if natural_bone_orientation:
+        command.append("--natural-bone-orientation")
     if str(game or "").strip().lower() == "l4d2":
         # L4D2: process the model against the selected survivor's skeleton instead of the
         # built-in GMod ValveBiped armature, so the compiled model lives in the survivor's

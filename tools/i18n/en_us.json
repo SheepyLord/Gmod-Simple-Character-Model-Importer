@@ -2620,6 +2620,7 @@
     "not_enough_configured_materials_c944a5ac": "not enough configured materials",
     "not_jiggle_27dbff1f": "Not Jiggle",
     "not_required_c641059b": "not required",
+    "note_any_bodygroup_listed_in_the_bodygroup_colu_b89f27d0": "Note: any bodygroup listed in the Bodygroup column keeps its flexes and therefore CANNOT be toggled off (hidden) in game. Remove a flex from a bodygroup here if you need that part to stay hideable.",
     "numbered_341eb9b2": "numbered",
     "numgrenades_4_1b429b27": "    Numgrenades = \"4\",\n",
     "numgrenades_60a69bb1": "Numgrenades",

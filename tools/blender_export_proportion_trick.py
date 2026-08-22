@@ -479,7 +479,7 @@ def fix_face_basis_stacking(guard_radius: float = COINCIDENT_WELD_GUARD_RADIUS) 
     }
 
 
-def prepare_armature_for_raw_export(armature: bpy.types.Object) -> dict[str, object]:
+def prepare_armature_for_raw_export(armature: bpy.types.Object, natural_orientation: bool = False) -> dict[str, object]:
     log(f"Preparing armature for raw Source export: {armature.name}")
     unhide_object(armature)
     set_active_only(armature)
@@ -515,6 +515,25 @@ def prepare_armature_for_raw_export(armature: bpy.types.Object) -> dict[str, obj
 
     modified: list[str] = []
     protected: list[str] = []
+    if natural_orientation:
+        # SFM static-bones mode (issue #141): keep every bone at its authored
+        # orientation. The synthetic +90-degree tail alignment exists to give
+        # jigglebones a uniform axis convention; SFM animators pose these bones
+        # by hand instead, and the synthetic orientation becomes the MDL bind
+        # pose they see whenever animation samples are deleted (the "awkward
+        # unnatural pose" from the issue). Jigglebones are disabled together
+        # with this flag, so the axis convention is not needed.
+        bpy.ops.object.mode_set(mode="OBJECT")
+        log("Keeping natural bone orientations (SFM static-bones mode); skipped the non-essential bone alignment pass.")
+        return {
+            "armature": armature.name,
+            "connected_bones_before": before_connected,
+            "connected_bones_after": after_connected,
+            "natural_orientation": True,
+            "protected_bones": 0,
+            "modified_nonessential_bones": 0,
+            "modified_bone_names": [],
+        }
     for bone in edit_bones:
         if is_essential_bone(bone.name):
             protected.append(bone.name)
@@ -1562,7 +1581,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     # high-bone-count MMD models (dense cloth/hair chains) otherwise abort
     # studiomdl in Step 14 with "Too many bones used in model".
     bone_limit_report = enforce_source_bone_limit(armature)
-    armature_report = prepare_armature_for_raw_export(armature)
+    armature_report = prepare_armature_for_raw_export(
+        armature, natural_orientation=bool(getattr(args, "natural_bone_orientation", False))
+    )
     physics_simplification_report = simplify_physics_for_source_compile()
 
     # L4D2: enforce Source's max-3-bones-per-vertex skinning limit (and drop junk vertex groups)
@@ -1691,6 +1712,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--report-json", required=True)
     parser.add_argument("--files-json", required=True)
     parser.add_argument("--remove-zero-weight-bones", action="store_true")
+    parser.add_argument(
+        "--natural-bone-orientation",
+        action="store_true",
+        help="Keep authored bone orientations (skip the +90deg non-essential tail alignment). Used by the SFM static-bones option (issue #141).",
+    )
     parser.add_argument("--game", default="gmod")
     parser.add_argument("--survivor-reference-smd", default="")
     return parser.parse_args(argv)

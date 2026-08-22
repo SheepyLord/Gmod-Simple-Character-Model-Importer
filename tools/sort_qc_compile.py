@@ -48,6 +48,13 @@ BAD_OPEN_BRACE_RE = re.compile(r"\((?P<line>\d+)\):\s*-\s*bad command\s+\{", re.
 ESSENTIAL_EXACT = {"ZArmTwist_L", "ZArmTwist_R", "ZHandTwist_L", "ZHandTwist_R", "Eye_L", "Eye_R"}
 GENDER_CHOICES = ("female", "male")
 GAME_CHOICES = ("gmod", "l4d2", "sfm")
+# Human-readable target names, used in messages the user has to act on
+# (e.g. "no studiomdl.exe is set for Left 4 Dead 2").
+GAME_DISPLAY_NAMES = {
+    "gmod": "Garry's Mod",
+    "l4d2": "Left 4 Dead 2",
+    "sfm": "Source Filmmaker",
+}
 GENDER_ANIMATION_INCLUDES = {
     "female": {
         # Playermodel QC needs ONLY the standard GMod player animation packs.
@@ -123,6 +130,11 @@ L4D2_SURVIVOR_SLOTS = (
     "manager",
 )
 DEFAULT_L4D2_SURVIVOR = "producer"
+# The four L4D1 survivors. Campaigns that show them as NPCs (The Passing, The
+# Sacrifice) load a separate survivors/survivor_<slot>_light.mdl model, so a
+# replacement addon must also ship that variant or the cameo keeps the stock
+# look (issue #135).
+L4D1_SURVIVOR_SLOTS = ("namvet", "teenangst", "biker", "manager")
 
 
 def normalize_survivor(value: object) -> str:
@@ -2643,6 +2655,11 @@ def directional_jiggle_block(row: dict[str, Any], invert_direction: bool = False
 
 def jiggle_qc_blocks(plan: dict[str, Any], excluded_bones: set[str] | None = None) -> tuple[list[str], list[str], list[str]]:
     excluded_bones = excluded_bones or set()
+    # SFM static-bones option (issue #141): jigglebone simulation bakes
+    # wind-like motion into SFM sessions and fights manual animation, so the
+    # toggle drops every $jigglebone block (bones stay ordinary, poseable).
+    if bool(plan.get("sfm_static_bones")) and normalize_game(plan.get("game")) == "sfm":
+        return [], [], []
     rows = [row for row in plan.get("rows", []) if isinstance(row, dict)]
     invert_direction = bool(plan.get("invert_jiggle_direction", False))
     jiggles: list[str] = []
@@ -3364,10 +3381,29 @@ def validate_plan(plan: dict[str, Any]) -> list[str]:
     if str(plan.get("author") or "") != "sheepylord":
         errors.append('author must be exactly "sheepylord".')
     gmod = plan.get("gmod") if isinstance(plan.get("gmod"), dict) else {}
-    if not Path(str(gmod.get("studiomdl_path") or "")).exists():
-        errors.append("Missing valid studiomdl.exe.")
-    if not Path(str(gmod.get("game_dir") or "")).exists():
-        errors.append("Missing valid Garry's Mod game directory.")
+    # NOTE: check the raw string BEFORE building a Path, and require the right
+    # kind of entry. Path("") collapses to Path("."), and "." exists, so a blank
+    # studiomdl_path used to pass this check; the compile then ran
+    # Popen(["."]) -> "PermissionError: [WinError 5] Access is denied" (issue
+    # #162, hit by users whose L4D2/SFM install was not auto-detected while
+    # their GMod one was).
+    game_label = GAME_DISPLAY_NAMES.get(normalize_game(plan.get("game")), "Garry's Mod")
+    studiomdl_raw = str(gmod.get("studiomdl_path") or "").strip()
+    if not studiomdl_raw:
+        errors.append(
+            f"No studiomdl.exe is set for {game_label}. Set the {game_label} install folder or "
+            "studiomdl.exe in Step 1 (manual) or on the main interface (auto-port)."
+        )
+    elif not Path(studiomdl_raw).is_file():
+        errors.append(f"studiomdl.exe for {game_label} was not found at: {studiomdl_raw}")
+    game_dir_raw = str(gmod.get("game_dir") or "").strip()
+    if not game_dir_raw:
+        errors.append(
+            f"No {game_label} game directory is set. Set the {game_label} install folder in Step 1 "
+            "(manual) or on the main interface (auto-port)."
+        )
+    elif not Path(game_dir_raw).is_dir():
+        errors.append(f"The {game_label} game directory was not found at: {game_dir_raw}")
     jiggles = {str(row.get("bone") or "") for row in plan.get("rows", []) if isinstance(row, dict) and str(row.get("jiggle_type") or "") != "Not Jiggle"}
     ignores = {str(row.get("bone") or "") for row in plan.get("rows", []) if isinstance(row, dict) and str(row.get("jiggle_type") or "") == "Omni Jiggle"}
     for bone in sorted(ignores - jiggles):
@@ -4391,6 +4427,63 @@ def copy_compiled_outputs_l4d2(game_dir: Path, addon_dir: Path, slot: str, has_a
     return files, errors
 
 
+def patch_mdl_internal_name(mdl_path: Path, new_name: str) -> None:
+    """Rewrite the studiohdr_t name[64] field (offset 12) of a compiled .mdl.
+
+    The engine loads models by file path, but several systems (model cache,
+    $includemodel resolution) read the internal name, so a renamed copy should
+    carry its own path. The header checksum is untouched: it ties the .mdl to
+    its .vvd/.vtx companions, which are copied unmodified."""
+    encoded = new_name.encode("ascii")
+    if len(encoded) > 63:
+        raise ValueError(f"Internal model name is longer than 63 bytes: {new_name}")
+    with open(mdl_path, "r+b") as handle:
+        magic = handle.read(4)
+        if magic != b"IDST":
+            raise ValueError(f"Not a studiomdl file (magic {magic!r}): {mdl_path}")
+        handle.seek(12)
+        handle.write(encoded.ljust(64, b"\x00"))
+
+
+def write_l4d2_light_model_copies(addon_dir: Path, slot: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Duplicate the compiled L4D1 survivor as survivor_<slot>_light (issue #135).
+
+    The Passing / The Sacrifice render the L4D1 survivors as NPCs through the
+    dedicated survivors/survivor_<slot>_light.mdl model, so without this copy a
+    replacement only applies in playable contexts. The full-detail model is
+    shipped under the _light name (replacement addons do not need the stock
+    lower-LOD geometry) with its internal name patched to match."""
+    files: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    slot = normalize_survivor(slot)
+    if slot not in L4D1_SURVIVOR_SLOTS:
+        return files, warnings
+    base = addon_dir / "models" / "survivors" / f"survivor_{slot}"
+    light = addon_dir / "models" / "survivors" / f"survivor_{slot}_light"
+    copied = 0
+    for ext in COMPILED_EXTENSIONS:
+        src = base.with_name(base.name + ext)
+        if not src.exists():
+            continue
+        dst = light.with_name(light.name + ext)
+        try:
+            shutil.copyfile(src, dst)
+            if ext == ".mdl":
+                patch_mdl_internal_name(dst, f"survivors/survivor_{slot}_light.mdl")
+            files.append(file_row(dst, "compiled_model_light"))
+            copied += 1
+        except Exception as exc:
+            warnings.append(f"Could not create The Passing _light variant {dst.name}: {exc}")
+    if copied:
+        emit(f"Added survivors/survivor_{slot}_light model copies for The Passing/The Sacrifice NPC cameo ({copied} file(s)).")
+    else:
+        warnings.append(
+            f"No compiled files were found to create survivors/survivor_{slot}_light; "
+            "The Passing/The Sacrifice NPC cameo will keep the stock model."
+        )
+    return files, warnings
+
+
 def write_l4d2_addonimage(plan: dict[str, Any], addon_dir: Path) -> Path | None:
     """Generate the L4D2 add-on thumbnail (addonimage.jpg) from the Step 13 release icon.
 
@@ -5125,6 +5218,10 @@ def compose(plan_path: Path) -> dict[str, Any]:
         errors.append(f"Failed to copy QC compile source folder: {exc}")
     if l4d2:
         compiled_files, compiled_errors = copy_compiled_outputs_l4d2(compile_game_dir, addon_dir, survivor_slot, carms_qc is not None)
+        if not compiled_errors:
+            light_files, light_warnings = write_l4d2_light_model_copies(addon_dir, survivor_slot)
+            compiled_files = compiled_files + light_files
+            warnings.extend(light_warnings)
     else:
         compiled_files, compiled_errors = copy_compiled_outputs(compile_game_dir, addon_dir, author, category, stems)
     generated_files.extend(compiled_files)

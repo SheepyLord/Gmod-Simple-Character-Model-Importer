@@ -2,10 +2,11 @@ name: Build Windows executable
 
 # Builds the PyInstaller executable on GitHub's Windows runners.
 #
-# By default this builds the "without Blender" variant: the ~380 MB Blender zip
-# is gitignored, so a CI checkout never has it, and the app downloads Blender on
-# first run anyway. Use the manual "Run workflow" button to also bundle Blender
-# (it is fetched and SHA256-verified by scripts/download_build_assets.ps1).
+# Push/PR builds produce the "without Blender" variant only: the ~380 MB Blender
+# zip is gitignored, so a CI checkout never has it, and the app downloads Blender
+# on first run anyway. Use the manual "Run workflow" button to bundle Blender
+# (fetched and SHA256-verified by scripts/download_build_assets.ps1) and/or to
+# skip the without-Blender variant.
 
 on:
   push:
@@ -14,8 +15,12 @@ on:
     branches: [main, master]
   workflow_dispatch:
     inputs:
+      build_no_blender:
+        description: "Build the without-Blender variant"
+        type: boolean
+        default: true
       bundle_blender:
-        description: "Also build the with-Blender variant (downloads ~380 MB)"
+        description: "Build the with-Blender variant (downloads ~380 MB)"
         type: boolean
         default: false
       onedir:
@@ -38,6 +43,27 @@ jobs:
     timeout-minutes: 90
 
     steps:
+      # `inputs` is null on push/PR, so the enabled variants are resolved once
+      # here rather than repeating an event check in every `if:` below.
+      - name: Resolve which variants to build
+        id: variants
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            no_blender="${{ inputs.build_no_blender }}"
+            with_blender="${{ inputs.bundle_blender }}"
+          else
+            no_blender=true
+            with_blender=false
+          fi
+          echo "no_blender=$no_blender" >> "$GITHUB_OUTPUT"
+          echo "with_blender=$with_blender" >> "$GITHUB_OUTPUT"
+          if [ "$no_blender" != "true" ] && [ "$with_blender" != "true" ]; then
+            echo "::error::Nothing to build - both variants are disabled. Enable at least one."
+            exit 1
+          fi
+          echo "without-Blender: $no_blender | with-Blender: $with_blender"
+
       - name: Check out repository
         uses: actions/checkout@v4
 
@@ -63,11 +89,12 @@ jobs:
         run: python -m compileall -q tools
 
       - name: Download and verify the Blender build asset
-        if: inputs.bundle_blender
+        if: steps.variants.outputs.with_blender == 'true'
         shell: powershell
         run: ./scripts/download_build_assets.ps1
 
       - name: Build without-Blender executable
+        if: steps.variants.outputs.no_blender == 'true'
         shell: powershell
         run: |
           $buildArgs = @{ Python = "python" }
@@ -75,7 +102,7 @@ jobs:
           ./tools/build_mmd_character_importer_exe_no_blender.ps1 @buildArgs
 
       - name: Build with-Blender executable
-        if: inputs.bundle_blender
+        if: steps.variants.outputs.with_blender == 'true'
         shell: powershell
         run: |
           $buildArgs = @{ Python = "python" }
@@ -90,10 +117,29 @@ jobs:
                           @{n = "MB"; e = { [math]::Round($_.Length / 1MB, 2) } } |
             Sort-Object MB -Descending | Format-Table -AutoSize | Out-String -Width 200
 
-      - name: Upload build artifact
+      # Only the executable is published; the RUN_ME.txt and dependency manifest
+      # stay build-log detail. compression-level 0 stores the .exe as-is instead
+      # of re-compressing an already-compressed PyInstaller binary.
+      # NOTE: GitHub always wraps artifacts in a .zip when you download them and
+      # offers no way to disable that; release.yml attaches the .exe to a
+      # GitHub Release, which downloads as a raw file.
+      - name: Upload executable artifact
+        if: inputs.onedir != true
         uses: actions/upload-artifact@v4
         with:
           name: GmodSimpleMMDCharacterImporter-${{ github.sha }}
+          path: release/*.exe
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+      # A -OneDir build is a folder, not a single .exe, so the whole portable
+      # folder is uploaded instead.
+      - name: Upload portable folder artifact
+        if: inputs.onedir == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: GmodSimpleMMDCharacterImporter-portable-${{ github.sha }}
           path: release/
           retention-days: 14
           if-no-files-found: error

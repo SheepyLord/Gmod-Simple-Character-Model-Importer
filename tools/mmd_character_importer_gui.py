@@ -2209,12 +2209,13 @@ class ProportionRunWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_blend: str, remove_zero_weight_bones: bool = True, game: str = "gmod", survivor: str = "producer") -> None:
+    def __init__(self, input_blend: str, remove_zero_weight_bones: bool = True, game: str = "gmod", survivor: str = "producer", natural_bone_orientation: bool = False) -> None:
         super().__init__()
         self.input_blend = input_blend
         self.remove_zero_weight_bones = bool(remove_zero_weight_bones)
         self.game = game
         self.survivor = survivor
+        self.natural_bone_orientation = bool(natural_bone_orientation)
         self.cancel_requested = False
 
     def cancel(self) -> None:
@@ -2235,6 +2236,7 @@ class ProportionRunWorker(QtCore.QThread):
                 cancel_check=self._cancelled,
                 game=self.game,
                 survivor=self.survivor,
+                natural_bone_orientation=self.natural_bone_orientation,
             )
             self.done.emit(
                 {
@@ -2822,6 +2824,7 @@ class FullImportWorker(QtCore.QThread):
         copy_to_sfm_usermod: bool = True,
         nodecal: bool = False,
         generate_vrd: bool = True,
+        sfm_static_bones: bool = False,
         merge_identical_textures: bool = True,
         max_texture_edge: int = 0,
     ) -> None:
@@ -2846,6 +2849,7 @@ class FullImportWorker(QtCore.QThread):
         self.merge_identical_textures = bool(merge_identical_textures)
         self.max_texture_edge = int(max_texture_edge or 0)
         self.generate_vrd = bool(generate_vrd)
+        self.sfm_static_bones = bool(sfm_static_bones)
         self.bodygroup_scale_factor = float(bodygroup_scale_factor or getattr(core, "DEFAULT_BODYGROUP_SCALE_FACTOR", 40.457))
         self.cancel_requested = False
         self.step_results: dict[int, dict[str, object]] = {}
@@ -3079,7 +3083,15 @@ class FullImportWorker(QtCore.QThread):
                 step9_input_blend = collision_result.output_blend
 
             self._stage(9, "Export Proportion Trick", str(step9_input_blend))
-            proportion_result = core.run_proportion_export(step9_input_blend, remove_zero_weight_bones=True, progress=self._log, cancel_check=self._cancelled, game=self.game, survivor=self.survivor)
+            proportion_result = core.run_proportion_export(
+                step9_input_blend,
+                remove_zero_weight_bones=True,
+                progress=self._log,
+                cancel_check=self._cancelled,
+                game=self.game,
+                survivor=self.survivor,
+                natural_bone_orientation=(self.game == "sfm" and self.sfm_static_bones),
+            )
             self._require_clean_report(9, proportion_result.report, "proportion export")
             self._write_marker(9, proportion_result.proportion_dir, outputs={"final_dir": str(proportion_result.final_dir), "files": str(proportion_result.files_path)}, report_path=proportion_result.report_path)
             self.step_results[9] = {"final_dir": str(proportion_result.final_dir), "report": str(proportion_result.report_path), "dir": str(proportion_result.proportion_dir)}
@@ -3168,6 +3180,7 @@ class FullImportWorker(QtCore.QThread):
             qc_plan["copy_to_gmod_addons"] = True
             qc_plan["copy_to_sfm_usermod"] = bool(self.copy_to_sfm_usermod)
             qc_plan["nodecal"] = bool(self.nodecal)
+            qc_plan["sfm_static_bones"] = bool(self.game == "sfm" and self.sfm_static_bones)
             qc_plan["merge_identical_textures"] = bool(self.merge_identical_textures)
             qc_plan["distribution_output_dir"] = self.distribution_output_dir
             qc_result = core.compile_and_compose_qc(proportion_result.final_dir, qc_plan, progress=self._log, cancel_check=self._cancelled)
@@ -4239,8 +4252,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
         main_sfm_label = getattr(self, "main_copy_to_sfm_usermod_label", None)
         if isinstance(main_sfm_label, QtWidgets.QWidget):
             main_sfm_label.setVisible(sfm)
-        # SFM-only: the "generate VRD" toggle (procedural skirt bones; off by default for SFM).
-        for attr in ("main_generate_vrd_check", "main_generate_vrd_label"):
+        # SFM-only: the "generate VRD" toggle (procedural skirt bones; off by default for SFM)
+        # and the "static bones" toggle (issue #141).
+        for attr in ("main_generate_vrd_check", "main_generate_vrd_label", "main_sfm_static_bones_check", "main_sfm_static_bones_label"):
             widget = getattr(self, attr, None)
             if isinstance(widget, QtWidgets.QWidget):
                 widget.setVisible(sfm)
@@ -4376,6 +4390,17 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self._t("preview.renderer_restart_hint", "Preview renderer change takes effect after restarting the tool."),
             8000,
         )
+
+    def current_sfm_static_bones_enabled(self) -> bool:
+        """SFM 'static bones' toggle (issue #141): no jigglebones + natural bone
+        orientations. Only meaningful when the selected game is SFM; every other
+        game always returns False so GMod/L4D2 output is unchanged."""
+        if self.selected_game != "sfm":
+            return False
+        check = getattr(self, "main_sfm_static_bones_check", None)
+        if isinstance(check, QtWidgets.QCheckBox):
+            return bool(check.isChecked())
+        return self.settings_bool(self.settings_store.value("main_sfm_static_bones", False), False)
 
     def current_texture_max_edge(self) -> int:
         """Step-12 'Max texture size' choice (longest edge, px). Reads the live combo, falling back
@@ -6370,6 +6395,21 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_generate_vrd_label = QtWidgets.QLabel("SFM procedural VRD")
         form.addRow(self.main_generate_vrd_label, self.main_generate_vrd_check)
         self.main_generate_vrd_check.toggled.connect(lambda _value: self.save_settings())
+        # SFM-only (issue #141): static bones. Skips every $jigglebone and keeps the
+        # authored bone orientations in the export, so deleting animation samples in
+        # SFM returns bones to a natural bind pose instead of the synthetic aligned one.
+        self.main_sfm_static_bones_check = QtWidgets.QCheckBox("Static bones (no jigglebones, natural orientations)")
+        self.main_sfm_static_bones_check.setChecked(False)
+        self.main_sfm_static_bones_check.setToolTip(
+            "SFM only. Off (default): jigglebones simulate cloth/hair and bones are exported with the "
+            "aligned orientation convention. "
+            "On: no $jigglebone blocks are compiled and bones keep their authored orientations, so "
+            "every bone is cleanly poseable in SFM and deleting animation samples returns the model "
+            "to a natural pose (issue #141)."
+        )
+        self.main_sfm_static_bones_label = QtWidgets.QLabel("SFM static bones")
+        form.addRow(self.main_sfm_static_bones_label, self.main_sfm_static_bones_check)
+        self.main_sfm_static_bones_check.toggled.connect(lambda _value: self.save_settings())
         layout.addLayout(form)
         layout.addWidget(self.main_gmod_row)
 
@@ -8471,6 +8511,17 @@ class ImporterWindow(QtWidgets.QMainWindow):
 
         table_group = QtWidgets.QGroupBox("Flexes")
         table_layout = QtWidgets.QVBoxLayout(table_group)
+        # Issue #144: a bodygroup that carries flexes is compiled as its own
+        # $model block (never a switchable $bodygroup with a `blank` option), so
+        # it cannot be hidden in game. Users lost hours to this, so say it here.
+        self.flex_bodygroup_notice = QtWidgets.QLabel(
+            "Note: any bodygroup listed in the Bodygroup column keeps its flexes and therefore "
+            "CANNOT be toggled off (hidden) in game. Remove a flex from a bodygroup here if you "
+            "need that part to stay hideable."
+        )
+        self.flex_bodygroup_notice.setObjectName("fieldHint")
+        self.flex_bodygroup_notice.setWordWrap(True)
+        table_layout.addWidget(self.flex_bodygroup_notice)
         table_actions = QtWidgets.QHBoxLayout()
         self.flex_merge_button = QtWidgets.QPushButton("Merge Selected")
         self.flex_merge_button.setEnabled(False)
@@ -10729,6 +10780,10 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 if isinstance(raw_main_sfm, str)
                 else bool(raw_main_sfm)
             )
+        if hasattr(self, "main_sfm_static_bones_check"):
+            self.main_sfm_static_bones_check.setChecked(
+                self.settings_bool(self.settings_store.value("main_sfm_static_bones", False), False)
+            )
         if hasattr(self, "main_generate_vrd_check"):
             self.main_generate_vrd_check.setChecked(
                 self.settings_bool(self.settings_store.value("main_generate_vrd", False), False)
@@ -11020,6 +11075,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.settings_store.setValue("main_copy_to_sfm_usermod", self.main_copy_to_sfm_usermod_check.isChecked())
         if hasattr(self, "main_generate_vrd_check"):
             self.settings_store.setValue("main_generate_vrd", self.main_generate_vrd_check.isChecked())
+        if hasattr(self, "main_sfm_static_bones_check"):
+            self.settings_store.setValue("main_sfm_static_bones", self.main_sfm_static_bones_check.isChecked())
         if hasattr(self, "model_manager_gmod_row"):
             self.settings_store.setValue("model_manager_gmod_path", self.model_manager_gmod_row.value())
         if hasattr(self, "main_model_name_edit"):
@@ -12263,6 +12320,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 if (self.selected_game == "sfm" and hasattr(self, "main_generate_vrd_check"))
                 else True
             ),
+            sfm_static_bones=self.current_sfm_static_bones_enabled(),
         )
         self.worker.log.connect(self.append_main_log)
         self.worker.progress.connect(self.set_main_progress)
@@ -18776,6 +18834,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             remove_zero_weight_bones=self.proportion_remove_zero_weight_check.isChecked(),
             game=self.selected_game,
             survivor=self.current_selected_survivor(),
+            natural_bone_orientation=self.current_sfm_static_bones_enabled(),
         )
         self.worker.log.connect(self.append_proportion_log)
         self.worker.done.connect(self.proportion_done)
@@ -22804,6 +22863,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             bool(self.qc_include_mci_metadata_check.isChecked()) if hasattr(self, "qc_include_mci_metadata_check") else True
         )
         plan["nodecal"] = self.current_nodecal_enabled()
+        plan["sfm_static_bones"] = self.current_sfm_static_bones_enabled()
         plan["gmod_experimental_arms"] = self.current_experimental_arms_enabled()
         plan["merge_identical_textures"] = self.current_merge_textures_enabled()
         qc_dir = Path(str(plan.get("qc_dir") or self.qc_output_edit.text().strip() or ""))
