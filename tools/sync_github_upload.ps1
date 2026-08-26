@@ -170,6 +170,8 @@ Copy-RequiredFile "steps.txt" "steps.txt"
 Copy-RequiredFile "Translation Templates Write.txt" "Translation Templates Write.txt"
 Copy-RequiredFile "README.md" "docs\MMDCharacterImporter_README.md"
 Copy-RequiredFile ".gitattributes" ".gitattributes"
+Copy-RequiredFile "run_linux.sh" "run_linux.sh"
+Copy-RequiredFile "requirements.txt" "requirements.txt"
 Copy-RequiredFile "reference\proportion_trick_script-main_new\README.md" "reference\proportion_trick_script-main_new\README.md"
 Copy-RequiredFile "reference\proportion_trick_script-main_new\operator_proportion_trick.py" "reference\proportion_trick_script-main_new\operator_proportion_trick.py"
 Copy-RequiredFile "reference\proportion_trick_script-main_new\Proportion_Trick\README.md" "reference\proportion_trick_script-main_new\Proportion_Trick\README.md"
@@ -202,17 +204,21 @@ __pycache__/
 .ruff_cache/
 .cache/
 blender-4.5.10-windows-x64.zip
+blender-4.5.10-linux-x64.tar.xz
 "@
 Write-TextFile ".gitignore" $GitIgnore
 
 $GitAttributes = @"
 * text=auto
 
+*.sh text eol=lf
+
 *.dll binary
 *.exe binary
 *.zip binary
 *.blend binary
 *.vmd binary
+*.tar.xz binary
 "@
 Write-TextFile ".gitattributes" $GitAttributes
 
@@ -422,6 +428,40 @@ does not, browse to the Garry's Mod install folder or to:
 ```text
 ...\GarrysMod\bin\studiomdl.exe
 ```
+
+## Run on Linux
+
+There is no Linux binary release; on Linux you run the program from source.
+Clone the repo and run the launch script:
+
+```bash
+git clone https://github.com/SheepyLord/Gmod-Simple-Character-Model-Importer.git
+cd Gmod-Simple-Character-Model-Importer
+bash run_linux.sh
+```
+
+The script creates a `.venv` virtual environment, installs the runtime
+dependencies from `requirements.txt`, and starts the GUI. It also checks for
+Wine/Proton (used by the final compile/packaging steps, see the limitations
+below) and prints install instructions when neither is found. On first run the
+app downloads the official Blender 4.5.10 Linux build (~360 MB) from
+blender.org and manages it under `~/.MMDCharacterImporter`.
+
+Requirements: a 64-bit distro with Python 3.11+ (3.12 recommended,
+Debian/Ubuntu: `sudo apt install python3 python3-venv`) and the Qt 6 system
+libraries (Debian/Ubuntu: `sudo apt install libxcb-cursor0 libxkbcommon-x11-0
+libegl1 libgl1`).
+
+Known limitations on Linux:
+
+- The Blender-side steps (import through proportion export) run natively.
+- StudioMDL, gmad and VTFCmd are Windows programs, and the Linux builds of
+  Garry's Mod / L4D2 do not ship StudioMDL. The final texture-conversion and
+  compile/packaging steps therefore need those tools from a Windows install of
+  the game (for example via Proton/Wine, using the `STUDIOMDL` and `VTFCMD`
+  environment variables to point at them), or finish those steps on Windows.
+- Running the Windows .exe release under Wine is not supported; use
+  `run_linux.sh` instead.
 
 ## Build The Program
 

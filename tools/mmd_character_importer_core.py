@@ -17,6 +17,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import urllib.parse
@@ -38,7 +39,10 @@ def bundled_resource_root() -> Path:
 ROOT = bundled_resource_root()
 TOOLS_DIR = ROOT / "tools"
 PLUGIN_DIR = ROOT / "plugins_software"
-BUNDLED_BLENDER_ZIP = ROOT / "blender-4.5.10-windows-x64.zip"
+# Issue #152: running from source on Linux uses the official Linux tar.xz instead of the
+# Windows zip. Windows keeps the exact same archive name/URL/checksum as before.
+IS_WINDOWS = os.name == "nt"
+BUNDLED_BLENDER_ZIP = ROOT / ("blender-4.5.10-windows-x64.zip" if IS_WINDOWS else "blender-4.5.10-linux-x64.tar.xz")
 CATS_ADDON_ZIP = PLUGIN_DIR / "Cats-Blender-Plugin-Unofficial4.5.3.2.zip"
 SOURCE_TOOLS_ZIP = PLUGIN_DIR / "blender_source_tools_3.4.3.zip"
 BONES_MERGER_ZIP = PLUGIN_DIR / "blender_bones_merger.zip"
@@ -94,10 +98,18 @@ BLENDER_LTS_INDEX_URL = "https://download.blender.org/release/Blender4.5/"
 # bundled zip against), so a downloaded or browsed zip can be checksum-validated at runtime.
 # NOTE: use the direct download.blender.org mirror, NOT www.blender.org/download/... -- the latter
 # serves an HTML landing page (text/html), not the zip, so it would fail the checksum.
-BLENDER_DOWNLOAD_URL = "https://download.blender.org/release/Blender4.5/blender-4.5.10-windows-x64.zip"
-EXPECTED_BLENDER_ZIP_NAME = "blender-4.5.10-windows-x64.zip"
-EXPECTED_BLENDER_SHA256 = "ef6d846b8015f47ade6df3f9322ce17419080a5d922fa562b6c966064fe30dce"
-EXPECTED_BLENDER_SIZE_BYTES = 398911842
+if IS_WINDOWS:
+    BLENDER_DOWNLOAD_URL = "https://download.blender.org/release/Blender4.5/blender-4.5.10-windows-x64.zip"
+    EXPECTED_BLENDER_ZIP_NAME = "blender-4.5.10-windows-x64.zip"
+    EXPECTED_BLENDER_SHA256 = "ef6d846b8015f47ade6df3f9322ce17419080a5d922fa562b6c966064fe30dce"
+    EXPECTED_BLENDER_SIZE_BYTES = 398911842
+else:
+    # sha256 from https://download.blender.org/release/Blender4.5/blender-4.5.10.sha256
+    BLENDER_DOWNLOAD_URL = "https://download.blender.org/release/Blender4.5/blender-4.5.10-linux-x64.tar.xz"
+    EXPECTED_BLENDER_ZIP_NAME = "blender-4.5.10-linux-x64.tar.xz"
+    EXPECTED_BLENDER_SHA256 = "198a4248b38899af661aa9241cebd746394eaddbfafbeb53152440de80b118f7"
+    EXPECTED_BLENDER_SIZE_BYTES = 377895960
+BLENDER_EXE_NAME = "blender.exe" if IS_WINDOWS else "blender"
 APP_DIR_NAME = "MMDCharacterImporter"
 ProgressCallback = Callable[[str], None]
 CancelCheck = Callable[[], bool]
@@ -1000,7 +1012,7 @@ def hash_file_metadata(path: Path) -> str:
 
 
 def parse_version_from_blender_zip_name(name: str) -> str:
-    match = re.search(r"blender-(4\.5\.\d+)-windows-x64\.zip", name, re.IGNORECASE)
+    match = re.search(r"blender-(4\.5\.\d+)-(?:windows|linux)-x64\.(?:zip|tar\.xz)", name, re.IGNORECASE)
     if not match:
         return "4.5"
     return match.group(1)
@@ -1161,13 +1173,15 @@ def latest_official_blender_zip_url(progress: ProgressCallback | None = None) ->
 
     parser = BlenderIndexParser()
     parser.feed(body)
+    archive_pattern = r"blender-4\.5\.\d+-windows-x64\.zip" if IS_WINDOWS else r"blender-4\.5\.\d+-linux-x64\.tar\.xz"
     candidates: list[tuple[tuple[int, int, int], str]] = []
     for link in parser.links:
         name = Path(urllib.parse.urlparse(link).path).name
-        if re.fullmatch(r"blender-4\.5\.\d+-windows-x64\.zip", name, flags=re.IGNORECASE):
+        if re.fullmatch(archive_pattern, name, flags=re.IGNORECASE):
             candidates.append((parse_version_tuple(parse_version_from_blender_zip_name(name)), name))
     if not candidates:
-        raise RuntimeError("no Blender 4.5 Windows x64 zip was found in the official download listing")
+        platform_label = "Windows x64 zip" if IS_WINDOWS else "Linux x64 tar.xz"
+        raise RuntimeError(f"no Blender 4.5 {platform_label} was found in the official download listing")
     _version_tuple, filename = sorted(candidates)[-1]
     return urllib.parse.urljoin(BLENDER_LTS_INDEX_URL, filename), filename
 
@@ -1213,7 +1227,14 @@ def download_file(
 
 
 def valid_zip(path: Path) -> bool:
+    """Validate a Blender archive: .zip everywhere (full CRC check), plus the Linux
+    .tar.xz (full-stream decode) for the from-source Linux run (issue #152)."""
     try:
+        if path.name.lower().endswith(".tar.xz"):
+            with tarfile.open(path, "r:xz") as archive:
+                for _member in archive:
+                    pass
+            return True
         with zipfile.ZipFile(path) as archive:
             return archive.testzip() is None
     except Exception:
@@ -1356,11 +1377,14 @@ def blender_zip_path(progress: ProgressCallback | None = None, cancel_check: Can
 
 
 def find_blender_exe_in_dir(root: Path) -> Path | None:
-    direct = root / "blender.exe"
-    if direct.exists():
+    direct = root / BLENDER_EXE_NAME
+    if direct.exists() and (IS_WINDOWS or direct.is_file()):
         return direct
-    for candidate in root.rglob("blender.exe"):
-        return candidate
+    for candidate in root.rglob(BLENDER_EXE_NAME):
+        # On Linux the launcher is an extensionless file named "blender"; skip
+        # directories and helper files of the same name deeper in the tree.
+        if IS_WINDOWS or (candidate.is_file() and os.access(candidate, os.X_OK)):
+            return candidate
     return None
 
 
@@ -1389,25 +1413,44 @@ def extract_blender(
     temp_root.mkdir(parents=True, exist_ok=True)
     emit(progress, f"Extracting Blender {version} to {target_root}")
     try:
-        with zipfile.ZipFile(zip_path) as archive:
-            members = archive.infolist()
-            total = len(members)
-            last_report = time.monotonic()
-            for index, member in enumerate(members, start=1):
-                if cancel_check and cancel_check():
-                    raise RuntimeError("operation was cancelled")
-                archive.extract(member, temp_root)
-                now = time.monotonic()
-                if now - last_report > 2.0:
-                    emit(progress, f"Extracting Blender: {index:,} / {total:,} files ({index * 100 // max(total, 1)}%)")
-                    last_report = now
+        if zip_path.name.lower().endswith(".tar.xz"):
+            # Linux from-source run (issue #152): the official Linux build ships as a
+            # tar.xz. Stream members so cancel/progress behave like the zip path, and
+            # preserve file modes so the extracted "blender" binary stays executable.
+            with tarfile.open(zip_path, "r:xz") as archive:
+                extract_filter = getattr(tarfile, "tar_filter", None)
+                last_report = time.monotonic()
+                for index, member in enumerate(archive, start=1):
+                    if cancel_check and cancel_check():
+                        raise RuntimeError("operation was cancelled")
+                    if extract_filter is not None:
+                        archive.extract(member, temp_root, filter=extract_filter)
+                    else:
+                        archive.extract(member, temp_root)
+                    now = time.monotonic()
+                    if now - last_report > 2.0:
+                        emit(progress, f"Extracting Blender: {index:,} files")
+                        last_report = now
+        else:
+            with zipfile.ZipFile(zip_path) as archive:
+                members = archive.infolist()
+                total = len(members)
+                last_report = time.monotonic()
+                for index, member in enumerate(members, start=1):
+                    if cancel_check and cancel_check():
+                        raise RuntimeError("operation was cancelled")
+                    archive.extract(member, temp_root)
+                    now = time.monotonic()
+                    if now - last_report > 2.0:
+                        emit(progress, f"Extracting Blender: {index:,} / {total:,} files ({index * 100 // max(total, 1)}%)")
+                        last_report = now
     except BaseException:
         shutil.rmtree(temp_root, ignore_errors=True)
         raise
     os.replace(temp_root, target_root)
     blender = find_blender_exe_in_dir(target_root)
     if not blender:
-        raise RuntimeError(f"Blender extraction completed but blender.exe was not found under {target_root}")
+        raise RuntimeError(f"Blender extraction completed but {BLENDER_EXE_NAME} was not found under {target_root}")
     (blender.parent / "portable").mkdir(parents=True, exist_ok=True)
     return blender
 

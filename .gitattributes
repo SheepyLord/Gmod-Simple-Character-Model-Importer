@@ -1,7 +1,10 @@
 * text=auto
 
+*.sh text eol=lf
+
 *.dll binary
 *.exe binary
 *.zip binary
 *.blend binary
 *.vmd binary
+*.tar.xz binary

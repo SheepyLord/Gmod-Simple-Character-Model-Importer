@@ -13,6 +13,7 @@ __pycache__/
 .ruff_cache/
 .cache/
 blender-4.5.10-windows-x64.zip
+blender-4.5.10-linux-x64.tar.xz
 MMDCharacterImporter.spec
 /9_arts
 /Github Upload

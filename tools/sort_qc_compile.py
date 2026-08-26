@@ -2022,6 +2022,102 @@ def distribution_compile_source_copy_dir(distribution_output_dir: Path, model: s
     return distribution_output_dir / f"{model}_{author}_qc_compile_source"
 
 
+# Issue #139: L4D2 ported survivors' arms drift left / cross in game. Step 9's proportion
+# trick fits the survivor skeleton onto the MMD model, which arrives posed in the GMOD
+# ValveBiped reference convention (arms ~40 deg below horizontal), while the survivor bind
+# pose holds the arms ~61 deg down. The a_proportions delta (proportions - reference)
+# therefore bakes a ~20 deg rotation into every arm-chain bone, and the autoplay predelta
+# applies that rotation on top of every included survivor animation (worst under the
+# weapon-hold/IK poses, where the hand IK chases the displaced weapon_bone and crosses the
+# arms). The WORKING GMod pipeline's delta is measurably position-only -- the fitted
+# skeleton and the GMod reference carry identical bone rotations -- so L4D2 is fixed by
+# giving its delta the same shape: every bone shared with the subtract reference keeps its
+# fitted POSITION (bone lengths / proportions) but takes the reference's ROTATION verbatim,
+# leaving a rotation-free delta. Bones only present in the fitted skeleton (MMD hair /
+# skirt / sleeve helpers) are untouched: stock animations never drive them, so they follow
+# their parent bone at the exported local offset either way.
+def neutralize_proportion_rotation_delta(anims_dir: Path, reference_name: str, label: str = "survivor model") -> dict[str, Any]:
+    report: dict[str, Any] = {"applied": False, "label": label, "reference": reference_name}
+    proportions_path = anims_dir / "proportions.smd"
+    reference_path = anims_dir / f"{reference_name}.smd"
+    if not proportions_path.exists() or not reference_path.exists():
+        report["reason"] = "proportions.smd or reference SMD missing"
+        emit(f"L4D2 proportion delta ({label}): anims/proportions.smd or anims/{reference_name}.smd is missing; rotation neutralization skipped.")
+        return report
+    try:
+        reference_poses = _read_smd_frame0_poses(reference_path)
+    except Exception as exc:
+        report["reason"] = f"unreadable reference SMD: {exc}"
+        emit(f"L4D2 proportion delta ({label}): could not read anims/{reference_name}.smd ({exc}); rotation neutralization skipped.")
+        return report
+    reference_rot_tokens = {
+        name: pose.split()[3:6] for name, pose in reference_poses.items() if len(pose.split()) >= 6
+    }
+    text = proportions_path.read_text(encoding="utf-8", errors="replace")
+    had_trailing_newline = text.endswith("\n")
+    lines = text.splitlines()
+    id_to_name: dict[int, str] = {}
+    state = ""
+    rewritten = 0
+    untouched_extra_bones: set[str] = set()
+    max_delta_deg = 0.0
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if line in {"nodes", "skeleton", "triangles"}:
+            state = line
+            continue
+        if line == "end":
+            state = ""
+            continue
+        if state == "nodes":
+            match = re.match(r'(-?\d+)\s+"(.*)"\s+(-?\d+)', line)
+            if match:
+                id_to_name[int(match.group(1))] = match.group(2)
+            continue
+        if state != "skeleton" or not line or line.startswith("time"):
+            continue
+        parts = line.split()
+        if len(parts) < 7 or not parts[0].lstrip("-").isdigit():
+            continue
+        name = id_to_name.get(int(parts[0]))
+        if name is None:
+            continue
+        rot_tokens = reference_rot_tokens.get(name)
+        if rot_tokens is None:
+            untouched_extra_bones.add(name)
+            continue
+        try:
+            old_matrix = rotation_matrix_xyz(*(float(value) for value in parts[4:7]))
+            new_matrix = rotation_matrix_xyz(*(float(value) for value in rot_tokens))
+            relative = matmul(old_matrix, [[new_matrix[j][i] for j in range(3)] for i in range(3)])
+            trace = max(-1.0, min(1.0, (relative[0][0] + relative[1][1] + relative[2][2] - 1.0) / 2.0))
+            max_delta_deg = max(max_delta_deg, math.degrees(math.acos(trace)))
+        except ValueError:
+            pass
+        prefix = raw_line[: len(raw_line) - len(raw_line.lstrip())]
+        lines[index] = prefix + " ".join(parts[:4] + list(rot_tokens) + parts[7:])
+        rewritten += 1
+    if not rewritten:
+        report["reason"] = "no shared bones found between proportions.smd and the reference SMD"
+        emit(f"L4D2 proportion delta ({label}): no shared bones between anims/proportions.smd and anims/{reference_name}.smd; rotation neutralization skipped.")
+        return report
+    proportions_path.write_text("\n".join(lines) + ("\n" if had_trailing_newline else ""), encoding="utf-8")
+    report.update(
+        {
+            "applied": True,
+            "rewritten_pose_lines": rewritten,
+            "untouched_extra_bones": len(untouched_extra_bones),
+            "max_rotation_delta_deg": round(max_delta_deg, 2),
+        }
+    )
+    emit(
+        f"L4D2 proportion delta ({label}): made position-only against anims/{reference_name}.smd "
+        f"({rewritten} pose line(s) rewritten; removed up to {max_delta_deg:.1f} deg of baked rotation; "
+        f"{len(untouched_extra_bones)} custom bone(s) untouched)."
+    )
+    return report
+
+
 def prepare_qc_source(plan: dict[str, Any]) -> Path:
     raw_source_dir = str(plan.get("source_dir") or "").strip()
     if not raw_source_dir:
@@ -4712,6 +4808,16 @@ def build_carms_qc(plan: dict[str, Any], source_dir: Path, definebones: list[str
     for smd in smds:
         shutil.copyfile(smd, carms_work / smd.name)
     copytree_clean(carms_dir / "anims", carms_work / "anims")
+    # Issue #139: the L4D2 first-person arms use the same proportion-subtract structure as the
+    # survivor model, so their delta gets the same position-only treatment (GMod is untouched:
+    # its delta is already rotation-free, and its c_arms subtract base is the issue-#121
+    # stock-arms reference built below).
+    if normalize_game(plan.get("game")) == "l4d2" and not bool(plan.get("l4d2_keep_proportion_rotation_delta")):
+        neutralize_proportion_rotation_delta(
+            carms_work / "anims",
+            gendered_reference_name(plan, carms_work / "anims"),
+            label="first-person arms",
+        )
     lines = qc_model_header(plan, arms=True)
     for smd in smds:
         lines.extend(bodygroup_block(smd.stem, smd.name))
@@ -4853,6 +4959,18 @@ def compose(plan_path: Path) -> dict[str, Any]:
     sfm = normalize_game(plan.get("game")) == "sfm"
     single_model = l4d2 or sfm  # no GMod-style "_pm" playermodel variant
     survivor_slot = normalize_survivor(plan.get("survivor"))
+
+    # Issue #139 (L4D2 arms drift/cross): strip the baked rotations out of the proportion
+    # delta so it only carries the MMD bone positions/lengths, matching the shape of the
+    # working GMod delta. Plan key l4d2_keep_proportion_rotation_delta restores the old
+    # (broken) behaviour if ever needed.
+    proportion_delta_report: dict[str, Any] | None = None
+    if l4d2 and not bool(plan.get("l4d2_keep_proportion_rotation_delta")):
+        proportion_delta_report = neutralize_proportion_rotation_delta(
+            source_dir / "anims",
+            gendered_reference_name(plan, source_dir / "anims", warnings),
+            label="survivor model",
+        )
 
     initial_qc = source_dir / "compile_initial.qc"
     write_lines(initial_qc, base_qc_lines(plan, source_dir, pm=False, include_flexes=False, for_definebone_capture=True))
@@ -5459,6 +5577,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
         "simple_vrd_immunity": str(simple_vrd_immunity_path) if simple_vrd_immunity_path else "",
         "dynamic_model_importer_manifest": str(dynamic_model_manifest_path) if dynamic_model_manifest_path else "",
         "definebone_count": len(definebones),
+        "l4d2_proportion_rotation_delta": proportion_delta_report,
         "definebone_repair": {
             "report": str(qc_dir / "missing_definebones_repair.json"),
             "inserted_bones": sorted(

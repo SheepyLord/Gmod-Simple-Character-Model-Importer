@@ -871,14 +871,17 @@ class BlenderSetupDialog(QtWidgets.QDialog):
         self.resize(600, 240)
 
         layout = QtWidgets.QVBoxLayout(self)
-        intro = QtWidgets.QLabel(
-            owner._t(
-                "blender_setup.intro",
-                "This build does not include Blender, which is required to process models.\n\n"
-                "Download Blender 4.5.10 now (~380 MB) from blender.org, or browse to a "
-                "blender-4.5.10-windows-x64.zip you have already downloaded.",
-            )
+        intro_text = owner._t(
+            "blender_setup.intro",
+            "This build does not include Blender, which is required to process models.\n\n"
+            "Download Blender 4.5.10 now (~380 MB) from blender.org, or browse to a "
+            "blender-4.5.10-windows-x64.zip you have already downloaded.",
         )
+        if not core.IS_WINDOWS:
+            # Issue #152 (run from source on Linux): the pinned archive is the Linux tar.xz;
+            # patch the archive name in the (possibly translated) prompt text.
+            intro_text = intro_text.replace("blender-4.5.10-windows-x64.zip", core.EXPECTED_BLENDER_ZIP_NAME)
+        intro = QtWidgets.QLabel(intro_text)
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -919,11 +922,16 @@ class BlenderSetupDialog(QtWidgets.QDialog):
         self._start("download", "")
 
     def _on_browse(self) -> None:
+        archive_filter = (
+            "Blender zip (blender-4.5*.zip *.zip)"
+            if core.IS_WINDOWS
+            else "Blender archive (blender-4.5*.tar.xz *.tar.xz *.zip)"
+        )
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             self._t("blender_setup.pick", "Select Blender zip"),
             str(Path.home()),
-            "Blender zip (blender-4.5*.zip *.zip)",
+            archive_filter,
         )
         if path:
             self._start("browse", path)
