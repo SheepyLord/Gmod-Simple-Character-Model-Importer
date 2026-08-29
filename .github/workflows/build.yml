@@ -64,12 +64,12 @@ jobs:
           echo "without-Blender: $no_blender | with-Blender: $with_blender"
 
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # README.md recommends 3.12; requirements-build.txt pins the exact
       # PySide6/numpy/Pillow/PyInstaller versions the release binaries ship with.
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           architecture: x64
@@ -124,7 +124,7 @@ jobs:
       # GitHub Release, which downloads as a raw file.
       - name: Upload executable artifact
         if: inputs.onedir != true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: GmodSimpleMMDCharacterImporter-${{ github.sha }}
           path: release/*.exe
@@ -136,7 +136,7 @@ jobs:
       # folder is uploaded instead.
       - name: Upload portable folder artifact
         if: inputs.onedir == true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: GmodSimpleMMDCharacterImporter-portable-${{ github.sha }}
           path: release/
