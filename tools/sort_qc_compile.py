@@ -2533,6 +2533,12 @@ def base_qc_lines(
         # nowhere to place the held weapon and drops it at the model origin; the survivor IK set
         # (incl. the "ikclip" weapon chain and ikautoplaylock 1) matches the base-game survivor.
         survivor_bones = l4d2_survivor_skeleton_bones(plan.get("survivor"))
+        if include_definebones:
+            # Issue #168: the compile's real bone set is the $definebone list, which can carry
+            # bones the bundled skeleton lacks (the injected TLS weapon bones for the L4D1
+            # slots). Emit attachments for those too. The -definebones capture pass passes no
+            # definebones and keeps the original bundle-only gate.
+            survivor_bones = survivor_bones | {bone.name for bone in parse_definebone_lines(include_definebones)}
         attachment_lines = l4d2_attachment_lines(survivor_bones)
         if attachment_lines:
             lines.extend(attachment_lines)
@@ -2572,7 +2578,18 @@ def base_qc_lines(
         return lines
     reference_name = gendered_reference_name(plan, source_dir / "anims")
     lines.append(f'$sequence reference "anims/{reference_name}" fps 1 \n')
-    lines.append('$origin 0 0 -2.50 \n\n')
+    if l4d2:
+        # Issue #168 (legs bent/twisted): NO root drop for L4D2. The -2.50 below is the GMod
+        # player-model convention; it lands in the proportion delta (anims/proportions loads
+        # after $origin, the reference sequence loads before it), sinking every animation pose
+        # 2.5 units. Measured on a real export that put the toes ~1.2 units UNDER the floor,
+        # and the survivor foot IK (ground rules + $ikautoplaylock, active every frame) then
+        # bends the knees ~4-6 units off-line to fish the feet back up. The stock survivor
+        # plays its animations with no shift at all, so the delta must reproduce the Step 9
+        # stance exactly.
+        lines.append('\n')
+    else:
+        lines.append('$origin 0 0 -2.50 \n\n')
     lines.append('$animation a_proportions "anims/proportions" subtract reference 0 \n\n')
     if l4d2:
         # L4D2 survivor MULTIPLAYER sequence-index alignment (issue #105). A survivor REPLACEMENT must
@@ -3193,27 +3210,6 @@ def collect_smd_bone_poses(source_dir: Path) -> dict[str, SmdBonePose]:
     return poses
 
 
-def smd_xyz_radians_to_qc_yxz_degrees(rx: float, ry: float, rz: float) -> tuple[float, float, float]:
-    sx, cx = math.sin(rx), math.cos(rx)
-    sy, cy = math.sin(ry), math.cos(ry)
-    sz, cz = math.sin(rz), math.cos(rz)
-    rx_m = [[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]]
-    ry_m = [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]]
-    rz_m = [[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]]
-    matrix = matmul(matmul(rz_m, ry_m), rx_m)
-
-    sin_b = max(-1.0, min(1.0, -matrix[1][2]))
-    b = math.asin(sin_b)
-    cos_b = math.cos(b)
-    if abs(cos_b) > 1.0e-8:
-        a = math.atan2(matrix[0][2], matrix[2][2])
-        c = math.atan2(matrix[1][0], matrix[1][1])
-    else:
-        c = 0.0
-        a = math.atan2(-matrix[2][0], matrix[0][0]) if sin_b > 0 else math.atan2(-matrix[0][2], matrix[2][2])
-    return (math.degrees(a), math.degrees(b), math.degrees(c))
-
-
 def format_definebone_float(value: float) -> str:
     if abs(value) < 0.00005:
         value = 0.0
@@ -3221,14 +3217,18 @@ def format_definebone_float(value: float) -> str:
 
 
 def make_definebone_from_smd_pose(bone: SmdBonePose, align_to_child: DefineBone | None = None) -> str:
-    qrx, qry, qrz = smd_xyz_radians_to_qc_yxz_degrees(*bone.local_rot)
+    """$definebone line in studiomdl's parse convention: the rotation fields are the
+    per-component DEGREES of the SMD/mdl RadianEuler in field order (ry, rz, rx) --
+    verified against the Crowbar-decompiled base-game L4D2 survivors (coach R_UpperArm,
+    R_Clavicle and L_Hand match to 5 decimals, compound rotations included)."""
+    rx, ry, rz = bone.local_rot
     values = [
         f"{bone.local_pos[0]:.6f}",
         f"{bone.local_pos[1]:.6f}",
         f"{bone.local_pos[2]:.6f}",
-        format_definebone_float(qrx),
-        format_definebone_float(qry),
-        format_definebone_float(qrz),
+        format_definebone_float(math.degrees(ry)),
+        format_definebone_float(math.degrees(rz)),
+        format_definebone_float(math.degrees(rx)),
         "0.000000",
         "0.000000",
         "0.000000",
@@ -3240,6 +3240,59 @@ def make_definebone_from_smd_pose(bone: SmdBonePose, align_to_child: DefineBone 
         child_values = list(align_to_child.value_tokens) if len(align_to_child.value_tokens) >= 6 else [format_definebone_float(value) for value in align_to_child.values]
         values = values[:3] + child_values[3:12]
     return f'$definebone "{bone.name}" "{bone.parent}" ' + " ".join(values) + " \n"
+
+
+# Issue #168: the TLS ("The Last Stand") two-handed-melee weapon bones. All four L4D2
+# survivors share this exact convention (identical local pos/RadianEuler across the
+# producer/coach/gambler/mechanic reference skeletons, values below copied verbatim from
+# producer), but the L4D1 survivor models never got L_weapon_bone (teenangst/biker/manager),
+# so a replacement compiled on those skeletons gives two-handed melees no left-hand anchor
+# and the game drops the weapon at the model origin. The included TLS animations drive these
+# bones by name, so declaring them via $definebone (+ the matching $attachment) is enough --
+# the community-verified fix.
+L4D2_TLS_WEAPON_BONES: tuple[SmdBonePose, ...] = (
+    SmdBonePose(
+        name="ValveBiped.weapon_bone",
+        parent="ValveBiped.Bip01_R_Hand",
+        local_pos=(2.856897, -1.536200, -0.973800),
+        local_rot=(-1.501147, -0.272558, -1.578261),
+        source_smd="l4d2_reference_skeletons/producer.smd",
+    ),
+    SmdBonePose(
+        name="ValveBiped.L_weapon_bone",
+        parent="ValveBiped.Bip01_L_Hand",
+        local_pos=(3.348999, -1.371000, 0.725000),
+        local_rot=(1.977842, -0.088017, 1.557794),
+        source_smd="l4d2_reference_skeletons/producer.smd",
+    ),
+)
+
+
+def inject_l4d2_tls_weapon_bones(definebones: list[str]) -> tuple[list[str], list[str]]:
+    """Ensure the TLS weapon bones exist in an L4D2 compile's $definebone set (issue #168).
+
+    Each missing bone is inserted directly after its parent hand's $definebone line so
+    parents always precede children. Bones whose parent is absent are skipped (never emit
+    an orphan). Returns (definebones, injected_bone_names); no-op when everything exists."""
+    definitions = parse_definebone_lines(definebones)
+    existing = {definition.name for definition in definitions}
+    out = list(definebones)
+    injected: list[str] = []
+    for bone in L4D2_TLS_WEAPON_BONES:
+        if bone.name in existing or bone.parent not in existing:
+            continue
+        parent_index = next(
+            (index for index, line in enumerate(out) if parse_definebone_lines([line]) and parse_definebone_lines([line])[0].name == bone.parent),
+            None,
+        )
+        line = make_definebone_from_smd_pose(bone)
+        if parent_index is None:
+            out.append(line)
+        else:
+            out.insert(parent_index + 1, line)
+        existing.add(bone.name)
+        injected.append(bone.name)
+    return out, injected
 
 
 def order_smd_definebone_names(smd_poses: dict[str, SmdBonePose]) -> list[str]:
@@ -5021,6 +5074,19 @@ def compose(plan_path: Path) -> dict[str, Any]:
         emit("Inserted missing parent definebones: " + ", ".join(str(name) for name in inserted))
     write_definebone_repair_report(qc_dir, definebone_repair_reports)
 
+    # Issue #168: L4D1-slot survivors (teenangst/biker/manager) lack the TLS L_weapon_bone,
+    # leaving two-handed melees with no left-hand anchor (weapon drops to the model origin).
+    # Declare any missing TLS weapon bone via $definebone; the attachment gate in
+    # base_qc_lines emits the matching $attachment once the bone is in the definebone set.
+    tls_injected_bones: list[str] = []
+    if l4d2:
+        definebones, tls_injected_bones = inject_l4d2_tls_weapon_bones(definebones)
+        if tls_injected_bones:
+            emit(
+                "Added missing TLS weapon bone definebone(s) for two-handed melee support: "
+                + ", ".join(tls_injected_bones)
+            )
+
     jiggle_lines: list[str] = []
     jiggles: list[str] = []
     ignores: list[str] = []
@@ -5578,6 +5644,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
         "dynamic_model_importer_manifest": str(dynamic_model_manifest_path) if dynamic_model_manifest_path else "",
         "definebone_count": len(definebones),
         "l4d2_proportion_rotation_delta": proportion_delta_report,
+        "l4d2_tls_weapon_bones_injected": tls_injected_bones,
         "definebone_repair": {
             "report": str(qc_dir / "missing_definebones_repair.json"),
             "inserted_bones": sorted(
