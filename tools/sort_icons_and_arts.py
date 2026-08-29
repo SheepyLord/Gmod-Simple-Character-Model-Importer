@@ -377,6 +377,28 @@ def bundled_vtfcmd_candidates() -> list[Path]:
     return unique
 
 
+# Issue #167: on Linux VTFCmd.exe runs under Wine, which cannot consume POSIX argument
+# paths (they get resolved relative to the working directory). Translate absolute POSIX
+# path arguments to Wine's default Z:\ drive mapping and launch through `wine` when it
+# is on PATH (otherwise rely on the distro's binfmt_misc handler). No-op on Windows.
+# Mirrors adapt_windows_tool_command in sort_qc_compile.py (the step tools stay
+# standalone scripts, like hidden_subprocess_kwargs).
+def adapt_windows_tool_command(command: list[str]) -> list[str]:
+    if os.name == "nt" or not command:
+        return command
+    executable = str(command[0])
+    if not executable.lower().endswith(".exe"):
+        return command
+    adapted = [executable]
+    for part in command[1:]:
+        text = str(part)
+        adapted.append("Z:" + text.replace("/", "\\") if text.startswith("/") else text)
+    wine = shutil.which("wine") or shutil.which("wine64")
+    if wine:
+        adapted.insert(0, wine)
+    return adapted
+
+
 def convert_to_vtf(vtfcmd: Path, image_path: Path, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     expected = output_dir / f"{image_path.stem}.vtf"
@@ -398,7 +420,9 @@ def convert_to_vtf(vtfcmd: Path, image_path: Path, output_dir: Path) -> Path:
             shutil.copyfile(image_path, actual_image)
             actual_output_dir = scratch_output
             staged_expected = actual_output_dir / f"{actual_image.stem}.vtf"
-        command = [str(vtfcmd), "-file", str(actual_image), "-output", str(actual_output_dir), "-silent"]
+        command = adapt_windows_tool_command(
+            [str(vtfcmd), "-file", str(actual_image), "-output", str(actual_output_dir), "-silent"]
+        )
         completed = subprocess.run(
             command,
             text=True,

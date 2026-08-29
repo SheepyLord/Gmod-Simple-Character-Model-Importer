@@ -726,6 +726,16 @@ def steam_library_roots() -> list[Path]:
     candidates = [steam / "steamapps" / "libraryfolders.vdf"]
     for drive in "CDEFGHIJKLMNOPQRSTUVWXYZ":
         candidates.append(Path(f"{drive}:/SteamLibrary/steamapps/libraryfolders.vdf"))
+    # Issue #167: native Linux Steam roots (regular and flatpak installs), so the game /
+    # studiomdl auto-detection works when running from source on Linux. These paths do
+    # not exist on Windows, so the Windows search is unchanged.
+    for posix_root in (
+        Path.home() / ".steam" / "steam",
+        Path.home() / ".steam" / "root",
+        Path.home() / ".local" / "share" / "Steam",
+        Path.home() / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam",
+    ):
+        candidates.append(posix_root / "steamapps" / "libraryfolders.vdf")
     for vdf in candidates:
         if not vdf.exists():
             continue
@@ -3115,7 +3125,34 @@ def write_lines(path: Path, lines: list[str]) -> None:
     path.write_text("".join(lines), encoding="utf-8")
 
 
+# Issue #167: on Linux the Windows tools (studiomdl.exe, gmad.exe, vpk.exe, VTFCmd.exe)
+# run under Wine, but a Windows program cannot consume POSIX argument paths: Wine's
+# Windows path layer strips the leading "/" and resolves them RELATIVE to the working
+# directory (the reporter's log shows -game /home/... resolved as
+# ...\0_qc_source\home\...\gameinfo.txt). Translate every absolute POSIX path argument
+# to Wine's default drive mapping (Z:\ is the filesystem root in a standard prefix)
+# and, when a `wine` binary is on PATH, launch through it explicitly so execution does
+# not depend on the distro's binfmt_misc registration. No-op on Windows.
+def adapt_windows_tool_command(command: list[str]) -> list[str]:
+    if os.name == "nt" or not command:
+        return command
+    executable = str(command[0])
+    if not executable.lower().endswith(".exe"):
+        return command
+    adapted = [executable]
+    for part in command[1:]:
+        text = str(part)
+        adapted.append("Z:" + text.replace("/", "\\") if text.startswith("/") else text)
+    wine = shutil.which("wine") or shutil.which("wine64")
+    if wine:
+        # Wine accepts a UNIX path for the program itself; only the ARGUMENTS need
+        # Windows form.
+        adapted.insert(0, wine)
+    return adapted
+
+
 def run_command(command: list[str], log_path: Path, cwd: Path | None = None) -> tuple[int, str]:
+    command = adapt_windows_tool_command(command)
     emit("Running: " + " ".join(f'"{part}"' if " " in str(part) else str(part) for part in command))
     process = subprocess.Popen(
         command,
@@ -3669,7 +3706,9 @@ def convert_one_vtf(vtfcmd: Path, image_path: Path, output_dir: Path) -> Path:
             staged_expected = actual_output_dir / f"{actual_image.stem}.vtf"
             if not path_is_ascii(image_path) or not path_is_ascii(output_dir):
                 emit(f"Staging VTF conversion through ASCII path: {actual_image}")
-        command = [str(vtfcmd), "-file", str(actual_image), "-output", str(actual_output_dir), "-silent"]
+        command = adapt_windows_tool_command(
+            [str(vtfcmd), "-file", str(actual_image), "-output", str(actual_output_dir), "-silent"]
+        )
         completed = subprocess.run(
             command,
             text=True,

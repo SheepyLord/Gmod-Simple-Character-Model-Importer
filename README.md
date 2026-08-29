@@ -134,10 +134,13 @@ Known limitations on Linux:
 
 - The Blender-side steps (import through proportion export) run natively.
 - StudioMDL, gmad and VTFCmd are Windows programs, and the Linux builds of
-  Garry's Mod / L4D2 do not ship StudioMDL. The final texture-conversion and
-  compile/packaging steps therefore need those tools from a Windows install of
-  the game (for example via Proton/Wine, using the `STUDIOMDL` and `VTFCMD`
-  environment variables to point at them), or finish those steps on Windows.
+  Garry's Mod / L4D2 do not ship StudioMDL. With Wine installed the app runs
+  those tools automatically (launching them through `wine` and translating
+  their path arguments to Wine's `Z:` drive). Install the game's WINDOWS build
+  through Steam (force it via Proton compatibility) so `bin/studiomdl.exe`
+  exists; the app auto-detects Steam installs under `~/.steam`,
+  `~/.local/share/Steam` and flatpak Steam, and the `STUDIOMDL` environment
+  variable still overrides the location manually.
 - Running the Windows .exe release under Wine is not supported; use
   `run_linux.sh` instead.
 

@@ -2,15 +2,14 @@ name: Build Windows executable
 
 # Builds the PyInstaller executable on GitHub's Windows runners.
 #
-# Push/PR builds produce the "without Blender" variant only: the ~380 MB Blender
+# PR builds produce the "without Blender" variant only: the ~380 MB Blender
 # zip is gitignored, so a CI checkout never has it, and the app downloads Blender
-# on first run anyway. Use the manual "Run workflow" button to bundle Blender
-# (fetched and SHA256-verified by scripts/download_build_assets.ps1) and/or to
-# skip the without-Blender variant.
+# on first run anyway. Pushes do NOT trigger builds; use the manual "Run
+# workflow" button to build on demand, to bundle Blender (fetched and
+# SHA256-verified by scripts/download_build_assets.ps1), and/or to skip the
+# without-Blender variant.
 
 on:
-  push:
-    branches: [main, master]
   pull_request:
     branches: [main, master]
   workflow_dispatch:
