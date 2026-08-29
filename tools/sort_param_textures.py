@@ -1087,13 +1087,23 @@ def generate_normal_from_base(input_path: Path, output_path: Path, bias: int = S
     return strength
 
 
-def save_base_png(input_path: Path, output_path: Path) -> tuple[tuple[int, int], tuple[int, int], bool]:
+def save_base_png(input_path: Path, output_path: Path) -> tuple[tuple[int, int], tuple[int, int], bool, bool]:
     image = open_image(input_path).convert("RGBA")
     original_size = image.size
     image, resized = resize_to_limit(image)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(output_path)
-    return original_size, image.size, resized
+    # Issue #169: record whether the base carries REAL transparency. Fully opaque
+    # materials should not run the in-game alpha-test path at all (the VMT drops
+    # $alphatest/$allowalphatocoverage for them), so renderer alpha quirks cannot
+    # punch rectangular holes into opaque suits/props. Threshold 250 tolerates
+    # compression noise while catching any genuine alpha content.
+    try:
+        alpha_extrema = image.getchannel("A").getextrema()
+        has_transparency = bool(alpha_extrema[0] < 250)
+    except Exception:
+        has_transparency = True
+    return original_size, image.size, resized, has_transparency
 
 
 def save_normal_png(input_path: Path, output_path: Path) -> tuple[tuple[int, int], tuple[int, int], bool]:
@@ -1376,10 +1386,11 @@ def process_textures(input_path: Path, plan_json: Path, report_json: Path, manif
         try:
             if not base_source or not base_source.exists():
                 raise FileNotFoundError(f"Base texture not found for {material_name}: {base_source}")
-            original_size, final_size, resized = save_base_png(base_source, base_output)
+            original_size, final_size, resized, base_has_transparency = save_base_png(base_source, base_output)
             row_report["base_original_size"] = list(original_size)
             row_report["base_output_size"] = list(final_size)
             row_report["base_resized"] = resized
+            row_report["base_has_transparency"] = base_has_transparency
             if "ao" in enabled_pbr:
                 ao_source = as_path(enabled_pbr["ao"].get("source"))
                 if ao_source and ao_source.exists():
@@ -1402,6 +1413,7 @@ def process_textures(input_path: Path, plan_json: Path, report_json: Path, manif
                 )
                 row_report["base_output_size"] = list(placeholder_size)
                 row_report["base_is_placeholder"] = True
+                row_report["base_has_transparency"] = False
                 row_report["base_placeholder_reason"] = str(exc)
                 row_report["warnings"].append(
                     f"Base texture missing or unreadable ({exc}); wrote a neutral placeholder. "

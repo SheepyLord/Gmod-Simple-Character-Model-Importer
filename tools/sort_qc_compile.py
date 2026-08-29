@@ -1987,6 +1987,9 @@ def material_plan_rows(manifest_path: Path) -> list[dict[str, Any]]:
                 # the legacy/auto-port path, which keeps the VMT unchanged).
                 "phongexp_png": str(row.get("phongexp_output_path") or ""),
                 "selfillum_png": str(row.get("selfillum_output_path") or ""),
+                # Issue #169: True/False when Step 12 measured the base's alpha; None for
+                # manifests written before the key existed (VMT then keeps the old alpha path).
+                "base_has_transparency": row.get("base_has_transparency") if isinstance(row.get("base_has_transparency"), bool) else None,
                 "pbr_enabled": row.get("pbr_enabled", []) if isinstance(row.get("pbr_enabled"), list) else [],
                 "warnings": row.get("warnings", []) if isinstance(row.get("warnings"), list) else [],
             }
@@ -3774,6 +3777,7 @@ def write_vmt(
     nodecal: bool = False,
     base_name: str | None = None,
     normal_name: str | None = None,
+    base_has_transparency: bool | None = None,
 ) -> None:
     target = normalize_game(game)
     sfm = target == "sfm"
@@ -3791,8 +3795,14 @@ def write_vmt(
     phong = phongexp_texture or f"{shared}/phong_exp"
     phong_fresnel = "[0.0 1.5 2]" if has_normal else "[0.0 0.5 1]"
     # SFM keeps alpha-test only for eye/effect/transparent materials; GMod/L4D2
-    # keep it on every material (unchanged, byte-identical).
-    include_alphatest = (not sfm) or sfm_material_keeps_alphatest(material_name)
+    # keep it on every material with real alpha content. Issue #169: when Step 12
+    # measured the base texture as FULLY OPAQUE (base_has_transparency is False),
+    # drop the whole alpha path ($alphatest/$allowalphatocoverage) -- an opaque
+    # material gains nothing from it, and renderer alpha-coverage quirks (seen on
+    # the GMod x86-64/Chromium branch) can punch rectangular holes through opaque
+    # surfaces when it is left on. None (older Step 12 manifests without the
+    # measurement) keeps the previous always-on behaviour byte-identical.
+    include_alphatest = ((not sfm) or sfm_material_keeps_alphatest(material_name)) and base_has_transparency is not False
     body = (
         "VertexLitGeneric\n"
         "{\n"
@@ -3810,8 +3820,9 @@ def write_vmt(
             '\t$alphatest "1"\n'
             "\t$alphatestreference 0.5\n"
         )
+    if base_has_transparency is not False:
+        body += '\t$allowalphatocoverage "1"\n'
     body += (
-        '\t$allowalphatocoverage "1"\n'
         f'\t$lightwarptexture "{shared}/lightwarptexture"\n'
         '\t$phong "1"\n'
         '\t$phongboost "1"\n'
@@ -4008,9 +4019,11 @@ def compose_materials(
         except Exception as exc:
             warnings.append(str(exc))
         vmt = out_dir / f"{material_name}.vmt"
+        base_has_transparency = row.get("base_has_transparency")
         write_vmt(
             vmt, author, model, material_name, has_normal, phongexp_texture, selfillum_mask,
             game=game, nodecal=nodecal, base_name=base_canon, normal_name=normal_canon,
+            base_has_transparency=base_has_transparency if isinstance(base_has_transparency, bool) else None,
         )
         files.append(file_row(vmt, "material_vmt"))
     if merge and dedup_saved:
