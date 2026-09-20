@@ -1,0 +1,13 @@
+S:L:SweetChild_0_4
+S:L:SweetChild_3_4
+B:S:SweetChild_0_7
+B:S:SweetChild_3_7
+B:S:SweetChild_0_8
+B:S:SweetChild_3_8
+S:R:SweetChild_0_11
+S:R:SweetChild_3_11
+B:H:MiddleBackHare1
+G:F:BackHare1_L
+G:F:BackHare3_L
+G:F:BackHare1_R
+G:F:BackHare3_R

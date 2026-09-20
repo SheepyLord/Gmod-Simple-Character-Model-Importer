@@ -1,0 +1,14 @@
+F:S:Sweet_0_0
+S:L:Sweet_0_3
+B:S:Sweet_0_6
+B:S:Sweet_0_10
+S:R:Sweet_0_13
+G:F:Sleeve_0_1_R
+G:F:Sleeve_0_1_L
+B:H:TailF1
+B:H:TailF3
+B:H:TailF5
+B:H:Hair_F1_L
+B:H:Hair_F5_L
+B:H:Hair_F1_R
+B:H:Hair_F5_R

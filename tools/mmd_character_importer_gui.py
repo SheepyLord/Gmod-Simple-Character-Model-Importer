@@ -6197,6 +6197,17 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_intro_label.setWordWrap(True)
         layout.addWidget(self.main_intro_label)
 
+        # Notice for AI agents that land on the packaged app: the repository ships a headless API
+        # and an agent guide; automating this GUI/exe is the wrong path for them.
+        self.main_agent_notice_label = QtWidgets.QLabel(
+            "AI agents: do not automate this compiled executable. Clone the GitHub repository and drive "
+            "the pipeline from source instead - AGENTS.md and the agent_guide folder document the headless "
+            "step API, the editable plan files, and the quality rules for high-quality ports."
+        )
+        self.main_agent_notice_label.setObjectName("fieldHint")
+        self.main_agent_notice_label.setWordWrap(True)
+        layout.addWidget(self.main_agent_notice_label)
+
         self.main_update_label = QtWidgets.QLabel("")
         self.main_update_label.setObjectName("fieldHint")
         self.main_update_label.setWordWrap(True)

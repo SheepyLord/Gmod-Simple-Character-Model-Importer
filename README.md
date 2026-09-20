@@ -3,6 +3,8 @@
 
 To developers: This repo can be directly ran from the source without downloading the .exe binary in the release. Please refer to the following instruction:
 
+To AI agents: clone this repository and drive the pipeline from source — start with [AGENTS.md](AGENTS.md) and the [agent_guide/](agent_guide/README.md) folder (headless step API, editable plan files, and the quality rules for high-quality ports). Do not automate the compiled executable.
+
 Gmod / SFM Steam Workshop Addon: https://steamcommunity.com/sharedfiles/filedetails/?id=3738916298
 L4D2 Steam Addon: https://steamcommunity.com/sharedfiles/filedetails/?id=3748993892
 
