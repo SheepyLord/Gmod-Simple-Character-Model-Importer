@@ -74,6 +74,13 @@ Decision rules:
   metallic/roughness/AO/emissive maps: they look for sibling files (fuzzy matched, possibly in a
   different sub-folder such as `extra texture/`), bake AO into the base, emit a phong-exponent map
   (`<mat>_exp`) and a self-illumination mask. Use them only when those maps exist; otherwise legacy.
+  The exact-stem matcher only looks **next to the `_D` file**: copy the rip's PBR folder
+  (`AOPBR/*_N.png`, `*_VC`, `*_HM`) into the workspace `0_source_mmd_assets/tex` before
+  `analyze_textures(scheme="unreal_wuwa")`. The analysis lists what it found per row under
+  `pbr.maps` but leaves everything disabled; to ship a map set on that row `use_normal: true`,
+  `normal_action: <normal_action_default>` (e.g. `convert_ue_rg`) and
+  `pbr.maps.<role>.enabled: true`, then `process_textures`. Inspect `png_normals/<Mat>_n.png`
+  afterwards: a correct tangent-space map is flat lavender with embossed seams/buckles.
 - `base_has_transparency` (recorded per material): fully opaque bases get **no `$alphatest` /
   `$allowalphatocoverage`** in the VMT; textures with real alpha keep them. If a material has a
   bogus alpha channel (bake artefacts), flatten its alpha to 255 in the PNG before Step 14.

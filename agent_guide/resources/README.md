@@ -19,3 +19,5 @@ the ratio of pelvis heights first, then fit per bone.
 Not included on purpose: character art (PSD/JPEG renders and screenshots are copyrighted game
 assets) and the human notebook (it embeds API keys). The equivalent logic lives in
 `tools/sort_release_description.py` (Step 15) and `tools/sort_qc_compile.py` (Step 14).
+
+- `render_spic_cycles.py` - headless Cycles portrait renderer for the corpus-standard `SPIC.png` (MMD Tools import, dance-VMD pose, overlay-shell removal, white-world lighting, GPU); usage in [`../07_icons_and_workshop_art.md`](../07_icons_and_workshop_art.md).

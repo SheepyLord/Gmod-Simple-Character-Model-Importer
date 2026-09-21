@@ -90,6 +90,21 @@ Multi-layer clothes also interact with **physics**: Step 8 builds hulls from the
 select as `source_bodygroups`; exclude coats/skirts so the ragdoll hulls hug the body, and give the
 skirt its own collision group (see [05](05_physics_ragdoll.md)).
 
+Splitting one atlas material into accessory bodygroups (game rips with 5-6 atlases where
+"Body" also holds the hairpin, earring, chains, tassels): a bodygroup source is an
+*object + material* chunk, so split the Step 5 output mesh into named objects **before** Step 6
+and re-run `analyze_bodygroups_blend` on the new blend. Headlessly: union-find the faces into
+connected islands (same material only), compute each island's dominant deform bone
+(`vertex_groups` weight sum), classify by bone name (`Piao048_L` -> Earring, `Piao_L*`/`Piao_R*`
+-> Chains, `Skirt*` or a `zmax` threshold -> Skirt, ...), select those faces in edit mode and
+`bpy.ops.mesh.separate(type="SELECTED")`, rename the new object to the bodygroup name (shape
+keys and the armature modifier survive the separation). The Step 5/6 blends are still in
+**metres** (Source units only appear inside the Step 6 analysis JSON), so divide any Source
+height threshold by the scale factor (47.5 units -> 1.174 m). Then regroup `source_uids` in the
+plan: `Face` gets every facial chunk plus eye bases, `Clothes` gets the top plus small attached
+decorations, each accessory its own group. The recorded Yinlin port used exactly this
+(`agent_guide` session 2026-09-20).
+
 Verification: the report lists `vertex_count` per bodygroup and `removed_zero_vertex_bodygroups`;
 open `..._bodygroups_sorted.blend` headlessly and check that every object has an armature modifier
 and that no object exceeds the vertex limit. Use `manual_edit_blend` when a chunk must be edited by

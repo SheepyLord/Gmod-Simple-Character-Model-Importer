@@ -20,7 +20,7 @@ automate the packaged executable.
 | 04 | [Bodygroups, layers and flexes](04_bodygroups_layers_and_flexes.md) | naming, hideability, detachable clothes over incomplete bodies, accessories, facial merge, flex naming |
 | 05 | [Physics ragdoll](05_physics_ragdoll.md) | the 18-body model and joint table, CoACD hull knobs, hair/skirt bodies (phys_rec classes), fitting the reference template |
 | 06 | [VRD procedural bones](06_vrd_procedural_bones.md) | selecting skirt helpers, confidence/side/rear rules, trigger budget, validation |
-| 07 | [Icons and Workshop art](07_icons_and_workshop_art.md) | render pipeline, choosing a VMD/frame, custom images, spawn icons, Workshop icon sizes |
+| 07 | [Icons and Workshop art](07_icons_and_workshop_art.md) | render pipeline, choosing a VMD/frame, custom images, spawn icons, Workshop icon sizes, the corpus Cycles `SPIC.png` portrait (`resources/render_spic_cycles.py`) |
 | 08 | [Compile: bodygroups, jiggles, packaging](08_compile_bodygroups_jiggles.md) | qc_plan schema, jiggle types and direction rules, hitbox groups, compile passes, game notes |
 | 09 | [Debugging and testing](09_debugging_and_testing.md) | logs/reports, error catalogue, HLMV/Crowbar checks, in-game checklist |
 | — | [resources/](resources/README.md) | reference 18-body physics mesh, human QC/collision blocks, real decision records |

@@ -114,6 +114,11 @@ Rules:
 - Group syntax: `{"group": 1, "bones": ["Skirt_0_0", "Skirt_0_1"], "rotation_type": "FS"}` — the
   **first** bone owns the hull; later bones' weight regions merge into it (use this to make one
   body from a short chain). Bones must be connected, non-ValveBiped, and not in another group.
+  **The later bones are merged away**: they are deleted from the skeleton and their weights fold
+  into the first bone, so the chain also loses those links for jigglebones and VRD. List a second
+  bone only when you can spare the link. A single-bone group on a sparse link (a few dozen
+  vertices) falls back to a primitive box (`coverage_score` 0.0, "Primitive fallback used"
+  warning) - prefer the root link of a column, which usually holds the most vertices.
 - Skirt classes by **position around the pelvis** (front/back/left/right), hair classes by position
   around the neck; when a bone sits on a diagonal, prefer the side class for skirts and the
   `FL`/`FR`/`BL`/`BR` diagonals for hair.

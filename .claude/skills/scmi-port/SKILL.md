@@ -20,9 +20,12 @@ executable.
    run the analyze half, open the plan JSON, apply the rules of the matching guide
    (02 bones, 03 materials, 04 bodygroups/flexes, 05 physics, 06 VRD, 07 icons, 08 compile),
    edit the plan, run the apply half, and read the report. Stop on `validation.ok == false`.
-4. After Step 14, verify with `agent_guide/09_debugging_and_testing.md`: reports, HLMV, then the
+4. Render the Workshop portrait the corpus way (`agent_guide/07_icons_and_workshop_art.md`,
+   `agent_guide/resources/render_spic_cycles.py`): contact sheet of dance frames, pick one, final
+   2000 px Cycles render to `9_art/SPIC.png`; the Step 13 spawn icons alone are not release art.
+5. After Step 14, verify with `agent_guide/09_debugging_and_testing.md`: reports, HLMV, then the
    in-game checklist. Report what you could and could not verify.
-5. Only modify code in `tools/` for a defect that reproduces across models; keep default output
+6. Only modify code in `tools/` for a defect that reproduces across models; keep default output
    byte-identical and gate new behaviour.
 
 ## Hard rules
